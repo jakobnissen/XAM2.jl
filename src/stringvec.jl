@@ -14,9 +14,10 @@ function Base.getindex(x::StringVec, i::Integer)
     return StringView(ImmutableMemoryView(x.data)[start:stop])
 end
 
-function Base.push!(x::StringVec, str::AbstractString)
-    cu = codeunits(str)::AbstractVector{UInt8}
-    append!(x.data, cu)
+Base.push!(x::StringVec, str::AbstractString) = push_codeunits!(x, codeunits(str))
+
+function push_codeunits!(x::StringVec, codeunits::AbstractVector{UInt8})
+    append!(x.data, codeunits)
     push!(x.offsets, length(x.data))
     return x
 end

@@ -27,7 +27,7 @@ end
 
 SAMFlags(x::UInt16) = new_sam_flags(x & 0x0fff)
 
-Integer(x::SAMFlags) = x.x
+Base.Integer(x::SAMFlags) = x.x
 
 function Base.iterate(x::SAMFlags, state::UInt16 = x.x)
     return if iszero(state)
