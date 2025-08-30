@@ -35,7 +35,7 @@ const BAM_FIXED_BYTES = 36
 struct RefMetaData end
 
 # R can be reader or writer.
-mutable struct BAMRecord{R}
+mutable struct BAMRecord{R, I}
     # fixed-length fields (see BAM specs for the details)
     # Length of alignment record, excluding this 32-bit field
     block_size::UInt32
@@ -175,7 +175,7 @@ mutable struct BAMReader{T <: IO}
 
     # This must be the last field so we can use a hack to initialize
     # the record and the reader at the same time
-    record::BAMRecord
+    record::BAMRecord{BAMReader, T}
 
     global function new_bam_reader(reader::BGZFReader{T}, copy::Bool) where {T}
         result = new{T}(
@@ -190,6 +190,10 @@ mutable struct BAMReader{T <: IO}
         result.record = record
         return result
     end
+end
+
+@inline function get_reader(x::BAMRecord{BAMReader, I}) where I
+    return x.reader::BAMReader{I}
 end
 
 # TODO: Handle errors better
@@ -301,8 +305,8 @@ function Base.close(reader::BAMReader)
     return close(reader.reader)
 end
 
-function BAMRecord(reader::BAMReader)
-    return BAMRecord{BAMReader}(
+function BAMRecord(reader::BAMReader{T}) where T
+    return BAMRecord{BAMReader, T}(
         BAM_FIXED_BYTES - sizeof(Int32) + 2, # size of empty BAM record
         -1, # meaning unmapped
         -1, # unmapped
@@ -339,7 +343,7 @@ end
 
 function reference_name(record::BAMRecord)::Union{AbstractString, Nothing}
     record.refid < 0 && return nothing
-    return record.reader.ref_names[record.refid + 1]
+    return get_reader(record).ref_names[record.refid + 1]
 end
 
 struct HasEq end
@@ -436,7 +440,7 @@ end
     return if ((u1 & 0x0f) != 0x04) | ((u2 & 0x0f) != 0x03)
         return false
     else
-        ref_length = record.reader.ref_lens[record.refid + 1]
+        ref_length = get_reader(record).ref_lens[record.refid + 1]
         ((u1 >> 4) == record.l_seq) & ((u2 >> 4) == ref_length)
     end
 end
@@ -474,19 +478,10 @@ end
 end
 
 function unsafe_load_fixed_fields(record::BAMRecord, buffer::ImmutableMemoryView{UInt8})
-    record.block_size = unsafe_load_integer_le(UInt32, buffer, 1)
-    record.refid = unsafe_load_integer_le(Int32, buffer, 5)
-    record.pos = unsafe_load_integer_le(Int32, buffer, 9)
-    record.l_read_name = @inbounds buffer[13]
-    record.mapq = @inbounds buffer[14]
-    record.bin = unsafe_load_integer_le(UInt16, buffer, 15)
-    record.n_cigar_op = unsafe_load_integer_le(UInt16, buffer, 17)
-    record.flags = SAMFlags(unsafe_load_integer_le(UInt16, buffer, 19))
-    record.l_seq = unsafe_load_integer_le(UInt32, buffer, 21)
-    record.next_refid = unsafe_load_integer_le(Int32, buffer, 25)
-    record.next_pos = unsafe_load_integer_le(Int32, buffer, 29)
-    record.tlen = unsafe_load_integer_le(Int32, buffer, 33)
-    return nothing
+    GC.@preserve record buffer unsafe_copyto!(
+        Ptr{UInt8}(pointer_from_objref(record)), pointer(buffer), BAM_FIXED_BYTES
+    )
+    nothing
 end
 
 function try_read!(x::BAMReader)::Union{BAMRecord, Nothing, XAMError}
@@ -531,7 +526,6 @@ function try_read!(x::BAMReader)::Union{BAMRecord, Nothing, XAMError}
     resize!(vector, remaining_bytes)
     remaining = MemoryView(vector)
 
-    resize!(record.data, remaining_bytes)
     memview = fill_bytes_to_data!(x, remaining_bytes)
     if isnothing(memview)
         x.error = XAMErrors.truncated_file
