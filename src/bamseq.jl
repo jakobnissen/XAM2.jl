@@ -5,23 +5,16 @@ end
 
 Base.ncodeunits(x::BAMSeq) = x.len
 
-const SEQ_LUT = let
-    x = zero(UInt128)
-    for (i, char) in enumerate("=ACMGRSVTWYHKDBN")
-        encoding = UInt8(char) % UInt128
-        encoding <<= (8 * i - 8)
-        x |= encoding
-    end
-    x
-end
+const SEQ_LUT = Tuple(b"=ACMGRSVTWYHKDBN")
+
+Base.codeunit(::BAMSeq) = UInt8
 
 function Base.codeunit(x::BAMSeq, i::Integer)
     i = Int(i)::Int
     @boundscheck checkbounds(1:x.len, i)
     byte = @inbounds x.data[(i + 1) >> 1]
     byte >>= ((4 * isodd(i)) & 7)
-    shift = 8 * (byte & 0x0f)
-    return (SEQ_LUT >>> shift) % UInt8
+    return SEQ_LUT[(byte & 0x0f) + 1]
 end
 
 function Base.thisind(x::BAMSeq, i::Int)

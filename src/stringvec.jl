@@ -9,8 +9,8 @@ Base.size(x::StringVec) = (length(x.offsets) - 1,)
 
 function Base.getindex(x::StringVec, i::Integer)
     @boundscheck checkbounds(x, i)
-    start = x.offsets[i] + 1
-    stop = x.offsets[i + 1]
+    start = @inbounds x.offsets[i] + 1
+    stop = @inbounds x.offsets[i + 1]
     return StringView(ImmutableMemoryView(x.data)[start:stop])
 end
 
