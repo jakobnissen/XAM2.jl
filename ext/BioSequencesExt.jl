@@ -47,7 +47,7 @@ function XAM2.sequence(
     eq_pos === nothing && return seq
     reflen = XAM2.reference_length(record)
     reflen === nothing && return nothing # no ref
-    length(ref) == bamref.len || throw(ArgumentError("Given reference has wrong length"))
+    length(ref) == reflen || throw(ArgumentError("Given reference has wrong length"))
     span = XAM2.mapping_span(record)
     span === nothing && return nothing
     cig = cigar(record)

@@ -1,5 +1,7 @@
 struct BAMSeq <: AbstractString
     data::ImmutableMemoryView{UInt8}
+    # Each byte stores two characters, so we need this field
+    # to distinguish an odd from an even length
     len::Int
 end
 
@@ -41,7 +43,7 @@ end
 
 function Base.prevind(x::BAMSeq, i::Int, n::Int = 1)
     @boundscheck checkbounds(1:(x.len + 1), i)
-    return i + n
+    return i - n
 end
 
 Base.prevind(x::BAMSeq, i::Integer, n::Integer = 1) = prevind(x, Int(i)::Int, Int(n)::Int)

@@ -1,5 +1,8 @@
-struct StringVec <: AbstractVector{String}
+struct StringVec <: AbstractVector{StringView{ImmutableMemoryView{UInt8}}}
     data::Vector{UInt8}
+
+    # Has length(StringVec) + 1 elements. E.g. when content is "a", "", "abc",
+    # this is [0, 1, 1, 4]
     offsets::Vector{UInt32}
 
     StringVec() = new(UInt8[], [0])
