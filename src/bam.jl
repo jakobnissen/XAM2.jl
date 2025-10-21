@@ -170,7 +170,7 @@ mutable struct BAMReader{T <: AbstractBufReader}
 
     global function new_bam_reader(reader::BGZFReader{T}, copy::Bool) where {T}
         buffer = UInt8[]
-        # TODO: Handle potential errors - is maybe not SAMHEader, can be error
+        # TODO: Handle potential errors - is maybe not SAMHeader, can be error
         # also, can throw
         (; header, stringvec, reflens, n_total_read) = parse_bam_header!(reader, buffer)
 
@@ -453,6 +453,7 @@ function sequence(record::BAMRecord)::Union{BAMSeq, Nothing}
     return BAMSeq(ImmutableMemoryView(record.data)[span], record.l_seq % Int)
 end
 
+# BAM does not store +33 quals, just raw quals
 function quality(record::BAMRecord)::Union{Nothing, ImmutableMemoryView{UInt8}}
     seq_bytes = (record.l_seq + 1) >> 1
     offset = record.l_read_name + 4 * record.n_cigar_op + seq_bytes

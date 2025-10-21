@@ -81,6 +81,22 @@ function tryparse_base10(::Type{T}, mem::ImmutableMemoryView{UInt8}) where {T <:
     return n % T
 end
 
+function tryparse_base10(::Type{T}, mem::ImmutableMemoryView{UInt8}) where {T <: Union{Int8, Int16, Int32}}
+    isempty(mem) && return nothing
+    start = @inbounds mem[1]
+    (is_positive, maxval, mem) = if start == UInt8('-')
+        length(mem) < 2 && return nothing
+        (false, abs(Int64(typemin(T))) % UInt64, @inbounds(mem[2:end]))
+    else
+        (true, typemax(T) % UInt64, mem)
+    end
+    n = @inline tryparse_base10(UInt64, mem)
+    isnothing(n) && return nothing
+    n > maxval && return nothing
+    n = n % T
+    return is_positive ? n : -n
+end
+
 @inline function unsafe_load_integer_le(::Type{T}, mem::ImmutableMemoryView{UInt8}, i::Int) where {T <: Integer}
     x = zero(T)
     shift = 0
