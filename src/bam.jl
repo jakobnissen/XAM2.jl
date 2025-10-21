@@ -159,7 +159,7 @@ mutable struct BAMReader{T <: AbstractBufReader}
     const ref_lens::Vector{Int32}
     const ref_names::StringVec
     const header::SAMHeader
-    const offset_first_record::Int
+    const offset_first_record::VirtualOffset
     const copy::Bool
     error::Union{Nothing, XAMError}
 
@@ -172,14 +172,15 @@ mutable struct BAMReader{T <: AbstractBufReader}
         buffer = UInt8[]
         # TODO: Handle potential errors - is maybe not SAMHeader, can be error
         # also, can throw
-        (; header, stringvec, reflens, n_total_read) = parse_bam_header!(reader, buffer)
+        (; header, stringvec, reflens) = parse_bam_header!(reader, buffer)
+        vo_at_first_record = virtual_position(reader)
 
         result = new{T}(
             reader,
             reflens,
             stringvec,
             header,
-            n_total_read,
+            vo_at_first_record,
             copy,
             nothing
         )
@@ -234,12 +235,8 @@ function Base.copy(record::BAMRecord{R, I}) where {R, I}
     return record
 end
 
-
-# TODO: Make this work!
 function seek_first_record(reader::BAMReader)
-    # Issue is that we need a virtual seek here, since we may not be in the beginning
-    # of a block.
-    seek(reader.reader, reader.offset_first_record)
+    virtual_seek(reader.reader, reader.offset_first_record)
     reset!(reader.record)
     return reader
 end
@@ -256,7 +253,6 @@ function parse_bam_header!(
             header::SAMHeader,
             stringvec::StringVec,
             reflens::Vector{Int32},
-            n_total_read::Int,
         }
     }
 
@@ -268,7 +264,6 @@ function parse_bam_header!(
 
     l_text = unsafe_load_integer_le(UInt32, memview, 5)
     l_text > typemax(Int32) % UInt32 && return XAMErrors.header_top_bit_set
-    n_total_read = 8
 
     memview = fill_bytes_to_data!(reader, buffer, l_text % Int + 4)
     isnothing(memview) && return XAMErrors.header_truncated
@@ -283,7 +278,6 @@ function parse_bam_header!(
 
     n_ref = unsafe_load_integer_le(UInt32, memview, l_text % Int + 1)
     n_ref > typemax(Int32) % UInt32 && return XAMErrors.header_top_bit_set
-    n_total_read += (l_text % Int) + 4
 
     for _ in 1:(n_ref % Int)
         memview = fill_bytes_to_data!(reader, buffer, 4)
@@ -300,11 +294,10 @@ function parse_bam_header!(
         l_ref = unsafe_load_integer_le(Int32, memview, l_name + 1)
         l_ref < 1 && return XAMErrors.header_empty_ref
 
-        n_total_read += 4 + 4 + l_name
         push!(reflens, l_ref)
     end
 
-    return (; header, stringvec, reflens, n_total_read)
+    return (; header, stringvec, reflens)
 end
 
 function fill_bytes_to_data!(reader::BAMReader, nbytes::Int)::Union{ImmutableMemoryView{UInt8}, Nothing}

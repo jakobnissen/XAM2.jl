@@ -1,7 +1,5 @@
 module XAM2
 
-# TODO : Reset reader. Go back to after header, reset underlying.
-
 using BufferIO: BufferIO,
     AbstractBufReader,
     BufReader,
@@ -16,9 +14,8 @@ using BufferIO: BufferIO,
 
 using MemoryViews: ImmutableMemoryView, MemoryView, split_last, split_each, split_at
 using StringViews: StringView
-using BGZFLib: BGZFReader
+using BGZFLib: BGZFReader, virtual_position, virtual_seek, VirtualOffset
 using CIGARStrings: CIGARStrings, AbstractCIGAR, BAMCIGAR, CIGAR, CIGARError, unsafe_switch_memory
-
 using XAMAuxData: XAMAuxData, AuxTag, try_auxtag
 
 export BAMRecord,
@@ -184,6 +181,13 @@ function copy_cigar(old_cigar::AbstractCIGAR, old_v::Vector{UInt8}, cp::Vector{U
     new_mem = ImmutableMemoryView(cp)[(cigar_v_offset + 1):(cigar_v_offset + length(cigarmem))]
     return unsafe_switch_memory(old_cigar, new_mem)
 end
+
+"""
+    seek_first_record(reader::Union{SAMReader, BAMReader}) -> reader
+
+Seek `reader` back to the first record.
+"""
+function seek_first_record end
 
 
 include("flags.jl")

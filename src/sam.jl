@@ -219,13 +219,14 @@ function sequence(record::SAMRecord)::Union{AbstractString, Nothing}
 end
 
 # TODO: This returns a vector with offset + 33 whereas the BAM one does not.
-function quality(record::SAMRecord)::Union{Nothing, ImmutableMemoryView{UInt8}}
+# should they be the same?
+function quality(record::SAMRecord)::Union{Nothing, AbstractString}
     view = ImmutableMemoryView(record.data)
     view = view[(record.qual_offset + 1):record.aux_offset]
     return if length(view) == 1 && @inbounds view[1] == UInt8('*')
         nothing
     else
-        view
+        StringView(view)
     end
 end
 
@@ -244,7 +245,7 @@ mutable struct SAMReader{T <: AbstractBufReader}
     const record::SAMRecord
     const offset_first_record::Int
     const header::SAMHeader
-    const fields::Memory{UnitRange{UInt32}}
+    const fields::Memory{UnitRange{UInt64}}
     const copy::Bool
     error::Union{Nothing, XAMError}
 end
@@ -252,9 +253,9 @@ end
 function SAMReader(reader::AbstractBufReader; copy::Bool = true)
     (header, offset_first_record) = read_initial_sam_header!(reader)
     record = SAMRecord()
-    fields = Memory{UnitRange{UInt32}}(undef, 12)
+    fields = Memory{UnitRange{UInt64}}(undef, 12)
     @inbounds for i in eachindex(fields)
-        fields[i] = UInt32(1):UInt32(0)
+        fields[i] = UInt64(1):UInt64(0)
     end
     return SAMReader{typeof(reader)}(reader, record, offset_first_record, header, fields, copy, nothing)
 end
@@ -309,6 +310,9 @@ function try_read!(reader::SAMReader)::Union{SAMRecord, Nothing, XAMError}
     line_view = get_next_line_view(reader.reader)
     line_view === nothing && return nothing
     stripped = _chomp(line_view)
+    length(stripped) > typemax(UInt32) && error(
+        "SAMReader only supports lines of length 2^32 - 1"
+    )
 
     # Read each tab-separated field
     fields = reader.fields
@@ -409,7 +413,7 @@ function try_read!(reader::SAMReader)::Union{SAMRecord, Nothing, XAMError}
 end
 
 function load_fields(
-        mem::Memory{UnitRange{UInt32}},
+        mem::Memory{UnitRange{UInt64}},
         stripped::ImmutableMemoryView{UInt8},
     )::Union{Nothing, XAMError}
     length(mem) == 12 || error() # cheaper assert
@@ -417,13 +421,13 @@ function load_fields(
     for field in split_each(stripped, UInt8('\t'))
         i += 1
         span = only(parentindices(field))
-        @inbounds mem[i] = (first(span) % UInt32):(last(span) % UInt32)
+        @inbounds mem[i] = (first(span) % UInt64):(last(span) % UInt64)
         i == 11 && break
     end
     i < 11 && return XAMErrors.missing_fields
     qual_span = @inbounds mem[11]
-    aux_start = last(qual_span) + UInt32(2)
-    aux_stop = last(only(parentindices(stripped))) % UInt32
+    aux_start = last(qual_span) + UInt64(2)
+    aux_stop = last(only(parentindices(stripped))) % UInt64
     @inbounds mem[12] = aux_start:aux_stop
     return nothing
 end
