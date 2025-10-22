@@ -45,6 +45,8 @@ using .Topologies: Topologies, Topology
 
 abstract type AbstractHeader <: AbstractDict{AuxTag, ImmutableMemoryView{UInt8}} end
 
+# TODO: Do not store a vector of HeaderFIeld, jsut store the raw
+# data
 struct HeaderHD <: AbstractHeader
     fields::Vector{HeaderField}
     major::UInt32

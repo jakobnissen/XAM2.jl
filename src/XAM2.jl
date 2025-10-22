@@ -18,6 +18,8 @@ using BGZFLib: BGZFReader, virtual_position, virtual_seek, VirtualOffset
 using CIGARStrings: CIGARStrings, AbstractCIGAR, BAMCIGAR, CIGAR, CIGARError, unsafe_switch_memory
 using XAMAuxData: XAMAuxData, AuxTag, try_auxtag
 
+using Automa: Automa, @re_str, onenter!, onexit!, onall!, rep, opt
+
 export BAMRecord,
     BAMReader,
     SAMRecord,
@@ -36,6 +38,9 @@ module XAMErrors
         invalid_cigar
         missing_fields # not enough tab fields
         invalid_integer
+        overflow
+        line_too_long # more than 4 GiB line
+        qname_too_long
 
     end
 end # module XAMErrors

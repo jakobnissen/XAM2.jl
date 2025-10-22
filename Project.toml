@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["Jakob Nybo Nissen <jakobnybonissen@gmail.com>"]
 
 [deps]
+Automa = "67c07d97-cdcb-5c2c-af73-a7f9c32a568b"
 BGZFLib = "b86bd9b6-aa64-492d-a0e2-e61a004d8aed"
 BufferIO = "ff366017-094f-4144-bd70-a828a0d67152"
 CIGARStrings = "e5b51f81-6ffd-4e20-bbec-f118e37ea906"
@@ -22,6 +23,7 @@ BGZFLib = {path = "../BGZFLib.jl"}
 BioSequencesExt = "BioSequences"
 
 [compat]
+Automa = "1.1.0"
 BioSequences = "3.5.0"
 BufferIO = "0.2.1"
 CIGARStrings = "0.1.1"
