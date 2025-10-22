@@ -130,8 +130,6 @@ mutable struct SAMRecord
     end
 end
 
-const CTX = Automa.CodeGenContext(; generator = :goto, clean = true)
-
 @eval function parse_record!(record::SAMRecord, data::ImmutableMemoryView{UInt8})
     length(data) > typemax(UInt32) && return XAMErrors.line_too_long
     empty!(record.data)

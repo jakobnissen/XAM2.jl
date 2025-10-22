@@ -18,7 +18,7 @@ using BGZFLib: BGZFReader, virtual_position, virtual_seek, VirtualOffset
 using CIGARStrings: CIGARStrings, AbstractCIGAR, BAMCIGAR, CIGAR, CIGARError, unsafe_switch_memory
 using XAMAuxData: XAMAuxData, AuxTag, try_auxtag
 
-using Automa: Automa, @re_str, onenter!, onexit!, onall!, rep, opt
+using Automa: Automa, @re_str, onenter!, onexit!, onall!, rep, rep1, opt
 
 export BAMRecord,
     BAMReader,
@@ -50,6 +50,8 @@ using .XAMErrors: XAMError
 struct Uninit end
 
 struct HasEq end
+
+const CTX = Automa.CodeGenContext(; generator = :goto, clean = true)
 
 function to_memory(v)
     result = Memory{eltype(v)}(undef, length(v))
