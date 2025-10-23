@@ -16,7 +16,7 @@ const HEADER_MACHINE = let
     pg = onexit!(header_start * re"PG\t" * header_content, [:check_unique, :pg])
 
     header = opt(hd) * rep(newline * (co | sq | rg | pg))
-    Automa.compile(header)
+    Automa.compile(header * rep(newline))
 end
 
 const HEADER_ACTIONS = Dict{Symbol, Expr}(
@@ -41,11 +41,11 @@ const HEADER_ACTIONS = Dict{Symbol, Expr}(
     :sq => :(push!(sqs, parse_sq(line_number, fields, field_mem))),
     :rg => quote
         id = parse_rg_pg(line_number, fields)
-        push!(rgs, HeaderRG(field_mem, id))
+        push!(rgs, HeaderRG(field_mem, id, length(fields)))
     end,
     :pg => quote
         id = parse_rg_pg(line_number, fields)
-        push!(pgs, HeaderPG(field_mem, id))
+        push!(pgs, HeaderPG(field_mem, id, length(fields)))
     end,
 )
 
@@ -97,6 +97,7 @@ abstract type AbstractHeader <: AbstractDict{AuxTag, ImmutableMemoryView{UInt8}}
 
 struct HeaderHD <: AbstractHeader
     fields::ImmutableMemoryView{UInt8}
+    len::Int
     major::UInt32
     minor::UInt32
     sort_order::SortOrder
@@ -105,6 +106,7 @@ end
 struct HeaderSQ <: AbstractHeader
     fields::ImmutableMemoryView{UInt8}
     sn::ImmutableMemoryView{UInt8}
+    len::Int
     ln::UInt32
     topology::Topology # linear by default
 end
@@ -112,13 +114,16 @@ end
 struct HeaderRG <: AbstractHeader
     fields::ImmutableMemoryView{UInt8}
     id::ImmutableMemoryView{UInt8}
+    len::Int
 end
 
 struct HeaderPG <: AbstractHeader
     fields::ImmutableMemoryView{UInt8}
     id::ImmutableMemoryView{UInt8}
+    len::Int
 end
 
+# TODO: Store the overall view somewhere in this struct, then impl MemoryView(::SAMHeader) as immut view
 struct SAMHeader
     header::Union{Nothing, HeaderHD}
     seqs::Vector{HeaderSQ}
@@ -143,8 +148,7 @@ function Base.iterate(h::AbstractHeader, state...)
     return (tag => val, s)
 end
 
-# TODO: Not in constant time. Store length perhaps?
-Base.length(h::AbstractHeader) = sum(==(UInt8('\t')), h.fields; init = 0) + 1
+Base.length(h::AbstractHeader) = h.len
 
 @eval function parse_header(data::ImmutableMemoryView{UInt8})
     line_number = 1
@@ -160,17 +164,30 @@ Base.length(h::AbstractHeader) = sum(==(UInt8('\t')), h.fields; init = 0) + 1
     rgs = HeaderRG[]
     pgs = HeaderPG[]
     cos = ImmutableMemoryView{UInt8}[]
-    $(Automa.generate_code(CTX, HEADER_MACHINE, HEADER_ACTIONS))
 
-    return SAMHeader(
-        hd,
-        sqs,
-        cos,
-        rgs,
-        pgs
-    )
+    $(Base.remove_linenums!(Automa.generate_init_code(CTX, HEADER_MACHINE)))
+    $(Base.remove_linenums!(Automa.generate_exec_code(CTX, HEADER_MACHINE, HEADER_ACTIONS)))
+
+    if cs < 0
+        col = p - something(findprev(==(0x0a), data, p), 0)
+        throw_automa_error(byte, line_number, col)
+    end
+
+    return SAMHeader(hd, sqs, cos, rgs, pgs)
 end
 
+@noinline function throw_automa_error(byte::UInt8, line_number::Int, col::Int)
+    msg = string(
+        "Cannot parse SAM/BAM header, got unexpected byte ",
+        repr(byte),
+        " at line ",
+        line_number,
+        " column ",
+        col,
+        "."
+    )
+    throw(HeaderError(line_number, msg))
+end
 
 function check_duplicate_tags(line_number::Int, tags::Vector{UInt16})
     length(tags) < 2 && return nothing
@@ -210,7 +227,7 @@ function parse_hd(fields::Vector{HeaderField}, fieldmem::ImmutableMemoryView{UIn
         end
     end
     major === nothing && throw(HeaderError("In HD line, did not find mandatory VN field"))
-    return HeaderHD(fieldmem, major, minor, sort_order)
+    return HeaderHD(fieldmem, length(fields), major, minor, sort_order)
 end
 
 function parse_vn_field(mem::ImmutableMemoryView{UInt8})::Union{Nothing, Tuple{UInt32, UInt32}}
@@ -250,7 +267,7 @@ function parse_sq(
     end
     ln === nothing && throw(HeaderError(line_number, "SQ line does not have mandatory LN field"))
     sn === nothing && throw(HeaderError(line_number, "SQ line does not have mandatory SN field"))
-    return HeaderSQ(field_mem, sn, ln, topology)
+    return HeaderSQ(field_mem, sn, length(fields), ln, topology)
 end
 
 function parse_rg_pg(

@@ -2,6 +2,7 @@ module XAM2
 
 using BufferIO: BufferIO,
     AbstractBufReader,
+    AbstractBufWriter,
     BufReader,
     CursorReader,
     VecWriter,
@@ -12,9 +13,16 @@ using BufferIO: BufferIO,
     get_buffer,
     line_views
 
-using MemoryViews: ImmutableMemoryView, MemoryView, split_last, split_each, split_at
+using MemoryViews:
+    ImmutableMemoryView,
+    MemoryView,
+    MutableMemoryView,
+    split_last,
+    split_each,
+    split_at
+
 using StringViews: StringView
-using BGZFLib: BGZFReader, virtual_position, virtual_seek, VirtualOffset
+using BGZFLib: BGZFReader, BGZFWriter, virtual_position, virtual_seek, VirtualOffset
 using CIGARStrings: CIGARStrings, AbstractCIGAR, BAMCIGAR, CIGAR, CIGARError, unsafe_switch_memory
 using XAMAuxData: XAMAuxData, AuxTag, try_auxtag
 
@@ -22,6 +30,7 @@ using Automa: Automa, @re_str, onenter!, onexit!, onall!, rep, rep1, opt
 
 export BAMRecord,
     BAMReader,
+    BAMWriter,
     SAMRecord,
     SAMReader,
     SAMHeader
@@ -117,7 +126,7 @@ function reg2bin(span::UnitRange{Int32})::UInt16
     # TODO: remove these checks, also the one at the bottom
     (start, stop) = (first(span), last(span))
     @assert start in Int32(0):Int32(2^29 - 1)
-    @assert stop in start:(Int32(2^29 - 1))
+    @assert stop in (start):(Int32(2^29 - 1))
 
     # If start is zero, the read is unmapped, and so the range
     # must be 0:0 exactly
@@ -125,8 +134,10 @@ function reg2bin(span::UnitRange{Int32})::UInt16
 
     # Convert start to an offset to make it zero-indexed.
     # Note that this will be -1 when span is 0:0.
-    # Then this will use arithmetic shit right.
+    # Then this will use arithmetic shift right.
     start -= one(start)
+    stop -= one(stop)
+
     result = if start >> 14 == stop >> 14
         div((1 << 15) - 1, 7) + (start >> 14)
     elseif start >> 17 == stop >> 17
@@ -201,8 +212,8 @@ include("flags.jl")
 include("stringvec.jl")
 include("header.jl")
 include("bamseq.jl")
-include("bam.jl")
 include("sam.jl")
+include("bam.jl")
 
 const XAMRecord = Union{SAMRecord, BAMRecord}
 

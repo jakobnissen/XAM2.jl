@@ -323,7 +323,7 @@ end
 function cigar(record::SAMRecord)::Union{Nothing, CIGAR, CIGARError}
     record.cigar === Uninit() || return record.cigar
     view = ImmutableMemoryView(record.data)
-    view = view[(record.cigar_offset + 1):(first(record.rname_span) - 1)]
+    view = view[(record.cigar_offset + 1):(first(record.rnext_span) - 2)]
     length(view) == 1 && @inbounds view[1] == UInt8('*') && return nothing
     return record.cigar = CIGARStrings.try_parse(CIGAR, view)
 end
@@ -334,6 +334,8 @@ function next_reference_name(record::SAMRecord)::Union{Nothing, AbstractString}
     view = view[first(span):last(span)]
     return if length(view) == 1 && @inbounds view[1] == UInt8('*')
         nothing
+    elseif length(view) == 1 && @inbounds view[1] == UInt8('=')
+        return reference_name(record)
     else
         StringView(view)
     end
@@ -375,6 +377,7 @@ mutable struct SAMReader{T <: AbstractBufReader}
     const reader::T
     const record::SAMRecord
     const offset_first_record::Int
+    const header::SAMHeader
     const copy::Bool
     error::Union{Nothing, XAMError}
 end
@@ -417,7 +420,7 @@ function read_initial_sam_header!(reader::AbstractBufReader)
     end
     data = get_unflushed(buffer)
     offset = length(data)
-    return (parse_sam_header(ImmutableMemoryView(data)), offset)
+    return (parse_header(ImmutableMemoryView(data)), offset)
 end
 
 function seek_first_record(reader::SAMReader)
@@ -476,3 +479,5 @@ function _chomp(x::ImmutableMemoryView{UInt8})::ImmutableMemoryView{UInt8}
     end
     @inbounds return x[1:len]
 end
+
+# TODO: Iterate
