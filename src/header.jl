@@ -150,6 +150,10 @@ end
 
 Base.length(h::AbstractHeader) = h.len
 
+# TODO: Consider what should be exported here.
+# Then review and document lifetimes: Is this data owned by the header
+# and cannot be mutated, or does it copy itself, such that you can pass in
+# a view that is later mutated?
 @eval function parse_header(data::ImmutableMemoryView{UInt8})
     line_number = 1
     mark = 0

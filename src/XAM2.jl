@@ -33,7 +33,32 @@ export BAMRecord,
     BAMWriter,
     SAMRecord,
     SAMReader,
-    SAMHeader
+    SAMHeader,
+    SAMFlag,
+    SAMFlags,
+    Flag,
+    XAMRecord,
+    push,
+    StringVec,
+    get_header,
+    query_name,
+    flags,
+    reference_name,
+    reference_length,
+    next_reference_name,
+    left_position,
+    sequence,
+    quality_string,
+    quality_scores,
+    aux_data,
+    is_mapped,
+    is_first,
+    is_last,
+    mapping_span
+
+public try_parse_record!,
+    HasEq
+
 
 module XAMErrors
 
@@ -50,6 +75,8 @@ module XAMErrors
         overflow
         line_too_long # more than 4 GiB line
         qname_too_long
+        qual_no_seq
+        qual_seq_mismatch
 
     end
 end # module XAMErrors
@@ -58,6 +85,12 @@ using .XAMErrors: XAMError
 
 struct Uninit end
 
+"""
+    HasEq()
+
+Zero-sized struct indicating that a BAM sequence contains `=`, and therefore cannot
+be returned as a `LongSequence`.
+"""
 struct HasEq end
 
 const CTX = Automa.CodeGenContext(; generator = :goto, clean = true)
@@ -68,13 +101,13 @@ function to_memory(v)
     return result
 end
 
-
 @static if isdefined(Base, :memoryindex)
     memory_index(x::MemoryRef) = memoryindex(x)
 else
     memory_index(x::MemoryRef) = Core.memoryrefoffset(x)
 end
 
+# Index in underlying memory of first index of MemoryView or Vector
 memory_index(v::Vector) = memory_index(Base.cconvert(Ptr, v))
 memory_index(m::MemoryView) = first(only(parentindices(m)))
 
@@ -122,6 +155,26 @@ end
     return x
 end
 
+function inbounds_write_base10!(mem::MutableMemoryView{UInt8}, n::Unsigned)::Int
+    T = typeof(n)
+    if iszero(n)
+        @inbounds mem[1] = 0x30
+        return 1
+    end
+    n_digits = 0
+    @inbounds while !iszero(n)
+        n_digits += 1
+        (n, rem) = divrem(n, T(10))
+        mem[n_digits] = (rem % UInt8) + 0x30
+    end
+    rv = n_digits
+    @inbounds for i in 1:(n_digits >> 1)
+        (mem[i], mem[rv]) = (mem[rv], mem[i])
+        rv -= 1
+    end
+    return n_digits
+end
+
 function reg2bin(span::UnitRange{Int32})::UInt16
     # TODO: remove these checks, also the one at the bottom
     (start, stop) = (first(span), last(span))
@@ -167,10 +220,13 @@ function reg2bins!(bins::Vector{UInt16}, span::UnitRange{Int32})
     # @assert !iszero(start) || iszero(stop)
 
     # TODO: Check the 0,0 case
+    idxs = (1, 9, 73, 585, 4681)
+    shifts = (26, 23, 20, 17, 14)
 
-    ranges = map((1, 9, 73, 585, 4681)) do idx
-        idx = idx % UInt16
-        (idx + (start >> 26) % UInt16):(idx + (stop >> 26) % UInt16)
+    ranges = map(1:5) do i
+        idx = @inbounds(idxs[i]) % UInt16
+        shift = @inbounds shifts[i] & 63
+        (idx + (start >> shift) % UInt16):(idx + (stop >> shift) % UInt16)
     end
 
     resize!(bins, sum(length, ranges; init = 0) + 1)
@@ -186,18 +242,32 @@ function reg2bins!(bins::Vector{UInt16}, span::UnitRange{Int32})
     return bins
 end
 
+# This internal function _assumes_ that:
+# * If old_cigar is a AbstractCIGAR, it aliases `old_vector`
+# * old_vector == new_vector
+function copy_cigar!(
+        old_cigar::Union{Nothing, Uninit, CIGARError, AbstractCIGAR},
+        old_vector::Vector{UInt8},
+        new_vector::Vector{UInt8},
+    )
+    if !isa(old_cigar, AbstractCIGAR)
+        return old_cigar
+    end
+    # First: Which index in `old_vector` does the backing memory of
+    # `old_cigar` start?
+    cigar_mem = MemoryView(old_cigar)
+    index_cigar_mem = memory_index(cigar_mem)
+    index_old_vec = memory_index(old_vector)
+    cigar_mem_start = index_cigar_mem - index_old_vec + 1
 
-copy_cigar(x::Union{Nothing, Uninit, CIGARError}, _::Vector{UInt8}, _::Vector{UInt8}) = x
-
-function copy_cigar(old_cigar::AbstractCIGAR, old_v::Vector{UInt8}, cp::Vector{UInt8})
-    # Find the view of `cp` that corresponds to the same data as the
-    # view that backs `old_cigar`
-    cigarmem = MemoryView(old_cigar)
-    cigar_offset = memory_index(cigarmem)
-    v_offset = memory_index(old_v)
-    cigar_v_offset = cigar_offset - v_offset
-    new_mem = ImmutableMemoryView(cp)[(cigar_v_offset + 1):(cigar_v_offset + length(cigarmem))]
-    return unsafe_switch_memory(old_cigar, new_mem)
+    # Now, copy the bytes of cigar_mem into `new_vector` as those same
+    # indices
+    # TODO: Inbounds once we've tested correctness
+    dst_mem = MemoryView(new_vector)[cigar_mem_start:((cigar_mem_start + length(cigar_mem)) - 1)]
+    copy!(dst_mem, cigar_mem) # TODO: Inbounds once we've checked
+    dst_mem = ImmutableMemoryView(dst_mem)
+    new_cigar = unsafe_switch_memory(old_cigar, dst_mem)
+    return new_cigar
 end
 
 """
@@ -215,13 +285,133 @@ include("bamseq.jl")
 include("sam.jl")
 include("bam.jl")
 
+"""
+Alias for Union{SAMRecord, BAMRecord}
+"""
 const XAMRecord = Union{SAMRecord, BAMRecord}
 
-flags(x::XAMRecord) = x.flags
-is_mapped(x::XAMRecord) = !in(UNMAP, flags(x))
-is_forward(x::XAMRecord) = in(READ1, flags(x))
-is_reverse(x::XAMRecord) = in(READ2, flags(x))
+"""
+Alias for Union{SAMReader, BAMReader}
+"""
+const XAMReader = Union{SAMReader, BAMReader}
 
+"""
+    query_name(record::XAMRecord)::Union{Nothing, AbstractString}
+
+Return the query name (QNAME) of `record`, or `nothing` if the data
+is not available.
+
+The name is returned as a UTF-8 encoded `AbstractString` which aliases
+the record.
+"""
+function query_name end
+
+"""
+    reference_name(record::XAMRecord)::Union{Nothing, AbstractString}
+
+Return the reference name (RNAME) of `record`, or `nothing` if the data
+is not available.
+
+The name is returned as a UTF-8 encoded `AbstractString`. For
+`SAMRecord`, this aliases the record, whereas for `BAMRecord`,
+the data aliases the owning `BAMReader` or `BAMWriter`.
+
+For `SAMRecord`, this function does _not_ validate that the reference
+name is present in the SAM header.
+"""
+function reference_name end
+
+"""
+    next_reference_name(record::XAMRecord)::Union{Nothing, AbstractString}
+
+Return the reference name of the next segment in the template (RNEXT) of `record`,
+or `nothing` if the data is not available.
+
+The name is returned as a UTF-8 encoded `AbstractString`. For
+`SAMRecord`, this aliases the record, whereas for `BAMRecord`,
+the data aliases the owning `BAMReader` or `BAMWriter`.
+
+For `SAMRecord`, this function does _not_ validate that the reference
+name is present in the SAM header.
+"""
+function next_reference_name end
+
+"""
+    reference_length(record::BAMRecord)::Union{Nothing, Int}
+
+Return the length of the reference that `record` is mapped to, or `nothing`
+if the record is not mapped.
+"""
+function reference_length end
+
+"""
+    left_position(record::XAMAuxData)::Union{Nothing, Int}
+
+Return the 1-based leftmost (i.e. 5' of the reference) mapped position
+of `record`, or `nothing` if the data is not available.
+"""
+function left_position end
+
+"""
+    cigar(record::SAMRecord)::Union{Nothing, CIGAR, CIGARError}
+    cigar(record::BAMRecord)::Union{Nothing, BAMCIGAR, CIGARError}
+
+Get the `cigar` of `record` as a `CIGARStrings.CIGAR` or
+`CIGARStrings.BAMCIGAR`, or return `nothing` if the data is not available,
+or a `CIGARStrings.CIGARError` if the cigar is malformed.
+
+This operation will validate the underlying data, and then cache
+the constructed cigar such that subsequent calls to this function
+is almost free.
+"""
+function cigar end
+
+"""
+    flags(record::XAMRecord)::SAMFlags
+
+Get the flags of `record`.
+"""
+flags(x::XAMRecord) = x.flags
+
+"""
+    is_mapped(record::XAMRecord)::Bool
+
+Check if the flags of `record` contain `SAMFlag.UNMAP`.
+"""
+is_mapped(x::XAMRecord) = !in(UNMAP, flags(x))
+
+"""
+    is_first(record::XAMRecord)::Bool
+
+Check if the flags of `record` contain `SAMFlag.READ1`.
+"""
+is_first(x::XAMRecord) = in(READ1, flags(x))
+
+"""
+    is_last(record::XAMRecord)::Bool
+
+Check if the flags of `record` contain `SAMFlag.READ2`.
+"""
+is_last(x::XAMRecord) = in(READ2, flags(x))
+
+"""
+    get_header(::XAMReader)::SAMHeader
+
+Get the header of the reader.
+"""
+function get_header end
+
+"""
+    mapping_span(record::XAMRecord)::Union{Nothing, UnitRange{Int}}
+
+Return the 1-based positions in the reference that `record` is mapped to,
+or `nothing` if this data is not available.
+
+E.g. a record with CIGAR `10M100S` mapping to reference position 5
+would map to `5:14`.
+
+This data requires the record to contain a valid `POS` and `CIGAR` fields.
+"""
 function mapping_span(record::XAMRecord)
     left = @something left_position(record) return nothing
     cig = cigar(record)

@@ -67,19 +67,21 @@ function get_seq(record::BAMRecord)
     offset = record.l_read_name + 4 * record.n_cigar_op
     chunks = Vector{UInt64}(undef, Int(div(record.l_seq + 0x07, 0x08)))
     data = record.data
+    # Copy over data
     GC.@preserve chunks data begin
         src = pointer(data, offset + 1)
         dst = Ptr{UInt8}(pointer(chunks))
         unsafe_copyto!(dst, src, n_seq_bytes)
     end
-    seq = LongDNA{4}(chunks, UInt(record.l_seq))
+    # Reverse each nuc in representation. This relies on
+    # internal repr of LongSequence, but that is unlikely to change.
     for i in eachindex(chunks)
         chunk = chunks[i]
         new_chunk = (chunk & 0x0f0f0f0f0f0f0f0f) << 4
         new_chunk |= (chunk & 0xf0f0f0f0f0f0f0f0) >> 4
         chunks[i] = new_chunk
     end
-    return seq
+    return LongDNA{4}(chunks, UInt(record.l_seq))
 end
 
 end # module BioSequencesExt.jl

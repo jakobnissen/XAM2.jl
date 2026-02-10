@@ -17,7 +17,11 @@ XAMAuxData = "e99d641e-1821-45d7-9150-ecb7bf333fe1"
 BioSequences = "7e6ae17a-c86d-528c-b3b9-7f778a29fe59"
 
 [sources]
+Automa = {path = "../Automa.jl"}
 BGZFLib = {path = "../BGZFLib.jl"}
+CIGARStrings = {path = "../CIGARStrings.jl"}
+MemoryViews = {path = "../MemoryViews.jl"}
+XAMAuxData = {path = "../XAMAuxData.jl"}
 
 [extensions]
 BioSequencesExt = "BioSequences"
@@ -26,7 +30,7 @@ BioSequencesExt = "BioSequences"
 Automa = "1.1.0"
 BioSequences = "3.5.0"
 BufferIO = "0.2.1"
-CIGARStrings = "0.1.1"
+CIGARStrings = "0.2.0"
 MemoryViews = "0.3.2"
 StringViews = "1.3.5"
 XAMAuxData = "0.1.3"

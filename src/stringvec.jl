@@ -1,3 +1,20 @@
+"""
+    StringVec <: AbstractVector{StringView{ImmutableMemoryView{UInt8}}}
+
+Compact vector of strings, backed by contiguous memory.
+Beside the core `AbstractVector` interface, this type supports:
+
+* `Base.push!(::StringVec, ::AbstractString)`
+
+```jldoctest
+julia> sv = StringVec()
+0-element StringVec
+
+julia> push!(sv, "Hello!")
+1-element StringVec:
+ "Hello!"
+```
+"""
 struct StringVec <: AbstractVector{StringView{ImmutableMemoryView{UInt8}}}
     data::Vector{UInt8}
 

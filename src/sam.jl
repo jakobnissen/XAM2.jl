@@ -107,11 +107,28 @@ const SAM_ACTIONS = Dict{Symbol, Expr}(
     end,
 )
 
+"""
+    SAMRecord
+
+A `SAMRecord` represents a non-header line of a SAM file.
+
+This type is semi-lazily validated.
+
+Construct a valid, but empty record with `SAMRecord()`.
+
+!!! warning
+    Mutating its backing memory will invalidate the record and
+    lead to logic bugs and garbage results, but should never cause
+    undefined behaviour in the absence of data races
+"""
 mutable struct SAMRecord
     # Data contains the unmodified input line.
     data::Vector{UInt8}
     cigar::Union{Uninit, Nothing, CIGAR, CIGARError}
 
+    # TODO: When parsing, set the values to sentinels
+    # if not mapped. This way, we can avoid checking mapping
+    # on every access operation
     rname_span::Tuple{UInt32, UInt32}
     rnext_span::Tuple{UInt32, UInt32}
     cigar_offset::UInt32 # cigar: cigar_offset+1:first(rnext_span)-1
@@ -130,7 +147,17 @@ mutable struct SAMRecord
     end
 end
 
-@eval function parse_record!(record::SAMRecord, data::ImmutableMemoryView{UInt8})
+"""
+    XAM2.try_parse_record!(
+        record::SAMRecord,
+        data::ImmutableMemoryView{UInt8}
+    )::Union{SAMRecord, XAMError}
+
+Parse the line `data` as a SAM record into `record`, returning it.
+If the data is invalid, `record` is will be in an invalid state,
+and return a `XAMError`.
+"""
+@eval function try_parse_record!(record::SAMRecord, data::ImmutableMemoryView{UInt8})
     length(data) > typemax(UInt32) && return XAMErrors.line_too_long
     empty!(record.data)
     append!(record.data, data)
@@ -182,6 +209,12 @@ function reset_fixed_fields!(record::SAMRecord)
     return record
 end
 
+"""
+    reset!(::SAMRecord)
+
+Resets the `SAMRecord` to its default state, deleting all information from it.
+After this function, the record is equal to a `SAMRecord()`.
+"""
 function reset!(record::SAMRecord)
     resize!(record.data, length(DEFAULT_SAM_DATA_CONTENT))
     @inbounds copyto!(MemoryView(record.data), ImmutableMemoryView(DEFAULT_SAM_DATA_CONTENT))
@@ -197,7 +230,7 @@ function Base.copy(record::SAMRecord)
         src = Ptr{UInt8}(pointer_from_objref(record)) + FIXED_SAM_OFFSET
         @ccall memcpy(dst::Ptr{UInt8}, src::Ptr{UInt8}, Csize_t(FIXED_SAM_SIZE)::Csize_t)::Cvoid
     end
-    record.cigar = copy_cigar(record.cigar, record.data, vector_copy)
+    record.cigar = copy_cigar!(record.cigar, record.data, vector_copy)
     return new
 end
 
@@ -205,7 +238,7 @@ end
 # Short form: Mapped, read name, strand
 function Base.show(io::IO, record::SAMRecord)
     mapped = is_mapped(record) ? "Mapped" : "Unmapped"
-    segment = is_forward(record) ? "Fw" : (is_reverse(record) ? "Rv" : "Md")
+    segment = is_first(record) ? "First" : (is_last(record) ? "Last" : "Middle")
     qname = query_name(record)
     qn = if qname === nothing
         ""
@@ -351,9 +384,13 @@ function sequence(record::SAMRecord)::Union{AbstractString, Nothing}
     end
 end
 
-# TODO: This returns a vector with offset + 33 whereas the BAM one does not.
-# should they be the same?
-function quality(record::SAMRecord)::Union{Nothing, AbstractString}
+"""
+    quality_string(record::SAMRecord)::Union{Nothing, AbstractString}
+
+Return the quality as a PHRED+33-encoded `AbstractString` aliasing the record,
+or `nothing` if the quality is not available.
+"""
+function quality_string(record::SAMRecord)::Union{Nothing, AbstractString}
     view = ImmutableMemoryView(record.data)
     view = view[(record.qual_offset + 1):(record.aux_offset - 1)]
     return if length(view) == 1 && @inbounds view[1] == UInt8('*')
@@ -363,6 +400,15 @@ function quality(record::SAMRecord)::Union{Nothing, AbstractString}
     end
 end
 
+"""
+    aux_data(record::SAMRecord)::XAMAuxData.SAM.MutableAuxiliary
+
+Return the auxiliary data as a mutable `XAMAuxData.SAM.Auxiliary`.
+If the record does not contain any auxiliary fields, the returned object
+is empty.
+
+See the documentation of `XAMAuxData.SAM.Auxiliary` for more details.
+"""
 function aux_data(record::SAMRecord)
     return XAMAuxData.SAM.Auxiliary(record.data, record.aux_offset + 1)
 end
@@ -372,6 +418,28 @@ function left_position(record::SAMRecord)::Union{Int, Nothing}
     return iszero(result) ? nothing : result
 end
 
+"""
+    mutable struct SAMReader{T <: AbstractBufReader}
+    
+Lazy reader of SAM files.
+
+`rdr = SAMReader` is an iterator over `SAMRecord`.
+The header can be obtained with [`get_header`](@ref)
+
+    SAMReader(
+        io::Union{IO, AbstractBufReader};
+        copy::Bool = true,
+    )::SAMReader
+
+Construct a `SAMReader` from `io`.
+This reader takes control of `io`. Mutating `io` after the reader is constructed
+is not permitted. Closing the resulting reader will close `io`.
+
+If `copy` is `false`, every record returned by iterating the reader or from
+`XAM2.try_read!` will be the same record, overwritten in-place. This improves
+efficiency, but new records will invalidate every previous one.
+To prevent aliasing, `copy` can be called manually on records.
+"""
 mutable struct SAMReader{T <: AbstractBufReader}
     # TODO: Must be able to buffer a line - put in docstring
     const reader::T
@@ -392,6 +460,12 @@ function SAMReader(io::IO; copy::Bool = true)
     return SAMReader(BufReader(io); copy)
 end
 
+# TODO: For both reader and writer
+# TODO: Close
+# TODO: open(do) method
+
+get_header(reader::SAMReader) = reader.header
+
 function Base.show(io::IO, reader::SAMReader)
     print(io, '<')
     summary(io, reader)
@@ -403,7 +477,6 @@ function Base.show(io::IO, ::MIME"text/plain", reader::SAMReader)
     print(io, ':')
     return print(io, "TODO!")
 end
-
 
 function read_initial_sam_header!(reader::AbstractBufReader)
     # We need to store a copy of the underlying data, and can't just store
@@ -429,13 +502,32 @@ function seek_first_record(reader::SAMReader)
     return reader
 end
 
+function Base.iterate(reader::SAMReader, _::Nothing = nothing)
+    result = try_read!(reader)
+    result === nothing && return nothing
+    isa(result, XAMError) && throw(result)
+    record = reader.copy ? copy(result) : result
+    return (record, nothing)
+end
+
+"""
+    XAM2.try_read(reader::SAMReader)::Union{SAMRecord, Nothing, XAMError}
+
+Attempt to read the next record of `reader`, similar to iterating the reader.
+If the reader is EOF, return `nothing`.
+If the next record is malformed, return a `XAMError`.
+Once this function returns a `XAMError`, subsequent calls to this function
+will return the same error until the reader is closed or seeked.
+
+This function does not throw if the reader's data is malformed.
+"""
 function try_read!(reader::SAMReader)::Union{SAMRecord, Nothing, XAMError}
     # Get a view of the current line, stripped from newline
     isnothing(reader.error) || return reader.error
     line_view = get_next_line_view(reader.reader)
     line_view === nothing && return nothing
     stripped = _chomp(line_view)
-    result = parse_record!(reader.record, stripped)
+    result = try_parse_record!(reader.record, stripped)
     @inbounds consume(reader.reader, length(line_view))
     return result
 end
@@ -479,5 +571,3 @@ function _chomp(x::ImmutableMemoryView{UInt8})::ImmutableMemoryView{UInt8}
     end
     @inbounds return x[1:len]
 end
-
-# TODO: Iterate

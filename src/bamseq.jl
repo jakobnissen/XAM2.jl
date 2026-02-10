@@ -34,7 +34,7 @@ function Base.thisind(x::BAMSeq, i::Int)
     iszero(i) && return 0
     i == x.len + 1 && return i
     @boundscheck checkbounds(1:x.len, i)
-    return i + 1
+    return i
 end
 
 Base.thisind(x::BAMSeq, i::Integer) = thisind(x, Int(i)::Int)
@@ -68,6 +68,9 @@ function bamseq!(dst::MutableMemoryView{UInt8}, src::ImmutableMemoryView{UInt8})
     target_len = (length(src) + 1) >>> 1
     if length(dst) < target_len
         throw(DimensionMismatch("dst size must be cld(length(src), 2)"))
+    end
+    for i in 1:target_len
+        @inbounds dst[i] = 0x00
     end
     for (i, byte) in enumerate(src)
         shift = isodd(i) ? 4 : 0

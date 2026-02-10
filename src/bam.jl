@@ -1,5 +1,22 @@
-# R can be reader or writer.
-mutable struct BAMRecord{R, I}
+"""
+    mutable struct BAMRecord{R}
+
+A single alignment record in a BAM file.
+
+The type parameter `R` is a concrete subtype of `BAMReader` or `BAMWriter`,
+and represents the owner of the record, which is needed to retrieve information
+on references stored in the record.
+
+`BAMRecord`s are semi-lazily parsed, and do not e.g. validate their CIGAR
+before access.
+
+    BAMRecord(io::Union{BAMReader, BAMWriter})::BAMRecord
+    
+Create an unmapped, empty (but valid) record referring `io`.
+"""
+mutable struct BAMRecord{R}
+    # R can be reader or writer.
+
     # This data contains, in order, with no unused bytes at the end:
     # 1. Read name including trailing null byte
     # 2. Cigar ops encoded in 32 bits each
@@ -7,8 +24,12 @@ mutable struct BAMRecord{R, I}
     # 4. Quality
     # 5. Auxiliary data
     const data::Vector{UInt8}
-    # We need a ref here because the refids point back to the header, stored in the reader/writer
+    # We need a ref here because the refids point back to the header,
+    # stored in the reader/writer
     const reader_or_writer::R
+
+    # This field is cached. Uninit means: Not computed. Nothing means no cigar.
+    # Otherwise, a cigar or invalid data.
     cigar::Union{Uninit, Nothing, BAMCIGAR, CIGARError}
 
     # fixed-length fields (see BAM specs for the details)
@@ -35,12 +56,10 @@ mutable struct BAMRecord{R, I}
     tlen::Int32
 
     global function new_uninitialized_record(
-            ::Type{I},
-            ::Type{R},
-            reader_or_writer,
+            reader_or_writer::R,
             data::Vector{UInt8}
-        ) where {I, R}
-        return new{R, I}(data, reader_or_writer, Uninit())
+        ) where {R}
+        return new{R}(data, reader_or_writer, Uninit())
     end
 end
 
@@ -64,7 +83,7 @@ const BAM_FIXED_BYTES = length(BAM_RECORD_CONTENT)
 # Short form: Mapped, read name, strand
 function Base.show(io::IO, record::BAMRecord)
     mapped = is_mapped(record) ? "Mapped" : "Unmapped"
-    segment = is_forward(record) ? "Fw" : (is_reverse(record) ? "Rv" : "Md")
+    segment = is_first(record) ? "First" : (is_last(record) ? "Last" : "Md")
     qname = query_name(record)
     qn = if qname === nothing
         ""
@@ -157,6 +176,33 @@ function Base.show(io::IO, ::MIME"text/plain", record::BAMRecord)
     return write(io, v)
 end
 
+"""
+    mutable struct BAMReader{T <: AbstractBufReader}
+    
+Lazy, multithreaded reader of BAM files.
+
+`rdr = BAMReader` is an iterator over `BAMRecord{typeof(rdr)}`.
+The header can be obtained with [`get_header`](@ref)
+
+    BAMReader(
+        io::Union{IO, AbstractBufReader};
+        copy::Bool = true,
+        n_workers::Int = Threads.nthreads()
+    )::BAMReader
+
+    BAMReader(bgzf::BGZFReader; copy::Bool=true)
+
+Construct a `BAMReader` from `io`, by wrapping `io` in a `BGZFLib.BGZFReader`.
+This reader takes control of `io`. Mutating `io` after the reader is constructed
+is not permitted. Closing the resulting reader will close `io`.
+
+If `copy` is `false`, every record returned by iterating the reader or from
+`XAM2.try_read!` will be the same record, overwritten in-place. This improves
+efficiency, but new records will invalidate every previous one.
+To prevent aliasing, `copy` can be called manually on records.
+
+The number of decompressing worker tasks is set by `n_workers`, which must be at least 1.
+"""
 mutable struct BAMReader{T <: AbstractBufReader}
     const reader::BGZFReader{T}
     # Lens and names in their own fields, because these are accessed far more often
@@ -171,7 +217,7 @@ mutable struct BAMReader{T <: AbstractBufReader}
     # These must be the last field so we can use a hack to initialize
     # the record and the reader at the same time.
     # That's also why it can't be const
-    record::BAMRecord{BAMReader, T}
+    record::BAMRecord{BAMReader{T}}
 
     global function new_bam_reader(reader::BGZFReader{T}, copy::Bool) where {T}
         buffer = UInt8[]
@@ -194,8 +240,21 @@ mutable struct BAMReader{T <: AbstractBufReader}
     end
 end
 
-const FIXED_BAM_OFFSET = fieldoffset(BAMRecord{BAMReader, BGZFReader{CursorReader}}, 4)
+# TODO: For both reader and writer
+# TODO: Close
+# TODO: open(do) method
 
+get_header(reader::BAMReader) = reader.header
+
+const FIXED_BAM_OFFSET = fieldoffset(BAMRecord{BAMReader{CursorReader}}, 4)
+
+"""
+    reset!(::BAMRecord)
+
+Resets the `BAMRecord` to its default state, deleting all information from it.
+After this function, the record is equal to an empty record created with
+`BAMRecord(reader_or_writer)`.
+"""
 function reset!(record::BAMRecord)
     resize!(record.data, 2)
     @inbounds record.data[1] = UInt8('*')
@@ -224,9 +283,9 @@ end
     return record
 end
 
-function Base.copy(record::BAMRecord{R, I}) where {R, I}
+function Base.copy(record::BAMRecord)
     vector_copy = copy(record.data)
-    cp = new_uninitialized_record(I, R, record.reader_or_writer, vector_copy)
+    cp = new_uninitialized_record(record.reader_or_writer, vector_copy)
     GC.@preserve cp record begin
         dst = Ptr{UInt8}(pointer_from_objref(cp)) + FIXED_BAM_OFFSET
         src = Ptr{UInt8}(pointer_from_objref(record)) + FIXED_BAM_OFFSET
@@ -236,18 +295,15 @@ function Base.copy(record::BAMRecord{R, I}) where {R, I}
             (BAM_FIXED_BYTES % UInt)::Csize_t,
         )::Cvoid
     end
-    record.cigar = copy_cigar(record.cigar, record.data, vector_copy)
-    return record
+    record.cigar = copy_cigar!(record.cigar, record.data, vector_copy)
+    return cp
 end
 
 function seek_first_record(reader::BAMReader)
+    # TODO: Check code base for when we reset reader.error
     virtual_seek(reader.reader, reader.offset_first_record)
     reset!(reader.record)
     return reader
-end
-
-@inline function get_reader(x::BAMRecord{BAMReader, I}) where {I}
-    return x.reader_or_writer::BAMReader{I}
 end
 
 function parse_bam_header!(
@@ -355,63 +411,11 @@ end
 
 BAMRecord(reader::BAMReader) = new_bam_record(reader, UInt8[])
 
-# TODO: Convert this to a writer version of this
-#= BAM:
-    qname  cigar seq qual aux
-
-    bin needs to be computed
-
-Compute src cigar, error if cigar error.
-
-Resize dst's vec to:
-    qname + 1 + 4 * n_cigar_op + cld(seq_len, 2) + qual
-
-Copy over qname and null byte
-
-Copy over cigar using CIGARStrings method
-
-Copy over seq, error if bad
-
-Copy over qual, minusing 33.
-
-Make a new empty mutable BAM.Auxilitary from existing vector, then copy over using new func
-
-Copy over all the fixed BAM fields.
-
-# function Base.copy!(dst::BAMRecord, src::SAMRecord)
-
-# 
-
-#     # Compute src cigar.
-
-#     # Compute src seq
-
-#     # Copy over cigar
-#     # Move cigar to right place
-#     # Copy over
-
-
-#     # Copy over data in vector
-#     c = cigar(src)
-#     n_cigar_ops = if c === nothing
-#         0
-#     elseif c isa XAMError
-#         # TODO: Should be a real Exception type here
-#         throw(XAMErrors.invalid_cigar)
-#     else
-#         length(c)
-#     end
-#     data_len = src.qname_len + 1 + 4 * n_cigar_ops +
-# end
-=#
-
-# TODO: need functions to write variable length fields to a BAMRecord
-
 function new_bam_record(reader::BAMReader{T}, v::Vector{UInt8}) where {T}
     resize!(v, 2)
     @inbounds v[1] = UInt8('*')
     @inbounds v[2] = 0x00
-    record = new_uninitialized_record(T, BAMReader, reader, v)
+    record = new_uninitialized_record(reader, v)
     return reset_fixed_fields!(record)
 end
 
@@ -428,19 +432,19 @@ end
 function reference_name(record::BAMRecord)::Union{Nothing, AbstractString}
     record.refID < 0 && return nothing
     id = record.refID + 1
-    return get_reader(record).ref_names[id]
+    return record.reader_or_writer.ref_names[id]
 end
 
 function next_reference_name(record::BAMRecord)::Union{Nothing, AbstractString}
     record.next_refID < 0 && return nothing
     id = record.next_refID + 1
-    return get_reader(record).ref_names[id]
+    return record.reader_or_writer.ref_names[id]
 end
 
 function reference(record::BAMRecord)
     record.refID < 0 && return nothing
     id = record.refID + 1
-    reader = get_reader(record)
+    reader = record.reader_or_writer
     # TODO: A single boundscheck here?
     return Reference(
         reader.ref_names[id],
@@ -451,7 +455,7 @@ end
 function reference_length(record::BAMRecord)::Union{Int, Nothing}
     record.refID < 0 && return nothing
     id = record.refID + 1
-    reader = get_reader(record)
+    reader = record.reader_or_writer
     return reader.ref_lens[id] % Int
 end
 
@@ -503,8 +507,16 @@ function sequence(record::BAMRecord)::Union{BAMSeq, Nothing}
     return BAMSeq(ImmutableMemoryView(record.data)[span], record.l_seq % Int)
 end
 
-# BAM does not store +33 quals, just raw quals
-function quality(record::BAMRecord)::Union{Nothing, ImmutableMemoryView{UInt8}}
+"""
+    quality_scores(record::BAMRecord)::Union{Nothing, ImmutableMemoryView{UInt8}}
+
+Return the quality as a PHRED-encoded memory view, or `nothing` if the quality is
+missing (set to all `0xFF`)
+
+Note that the returned quality does not have a PHRED offset, so e.g. a PHRED
+score of 31 is encoded as `UInt8(31)` as opposed to e.g. `UInt8(31 + 33)`.
+"""
+function quality_scores(record::BAMRecord)::Union{Nothing, ImmutableMemoryView{UInt8}}
     seq_bytes = (record.l_seq + 1) >> 1
     offset = record.l_read_name + 4 * record.n_cigar_op + seq_bytes
     qual = ImmutableMemoryView(record.data)[(offset + 1):(offset + record.l_seq)]
@@ -517,6 +529,15 @@ function quality(record::BAMRecord)::Union{Nothing, ImmutableMemoryView{UInt8}}
     end
 end
 
+"""
+    aux_data(record::BAMRecord)::XAMAuxData.BAM.MutableAuxiliary
+
+Return the auxiliary data as a mutable `XAMAuxData.BAM.Auxiliary`.
+If the record does not contain any auxiliary fields, the returned object
+is empty.
+
+See the documentation of `XAMAuxData.BAM.Auxiliary` for more details.
+"""
 function aux_data(record::BAMRecord)
     seq = record.l_seq
     n_seq_bytes = (seq + 1) >> 1
@@ -554,7 +575,7 @@ end
     return if ((u1 & 0x0f) != 0x04) | ((u2 & 0x0f) != 0x03)
         return false
     else
-        ref_length = get_reader(record).ref_lens[record.refID + 1]
+        ref_length = record.reader_or_writer.ref_lens[record.refID + 1]
         ((u1 >> 4) == record.l_seq) & ((u2 >> 4) == ref_length)
     end
 end
@@ -591,6 +612,17 @@ function unsafe_load_fixed_fields(record::BAMRecord, buffer::ImmutableMemoryView
     return nothing
 end
 
+"""
+    XAM2.try_read(reader::BAMReader)::Union{BAMRecord, Nothing, XAMError}
+
+Attempt to read the next record of `reader`, similar to iterating the reader.
+If the reader is EOF, return `nothing`.
+If the next record is malformed, return a `XAMError`.
+Once this function returns a `XAMError`, subsequent calls to this function
+will return the same error until the reader is closed or seeked.
+
+This function does not throw if the reader's data is malformed.
+"""
 function try_read!(x::BAMReader)::Union{BAMRecord, Nothing, XAMError}
     isnothing(x.error) || return x.error
 
@@ -643,34 +675,22 @@ function try_read!(x::BAMReader)::Union{BAMRecord, Nothing, XAMError}
     return x.record
 end
 
-#=
-Write a BAM record directly.
-    TODO: This implies the fields should be public! We can do that
-
-Publizise parse_record!(::SAMRecord, bytes) (with a better name)
-
-Overwrite a BAM record with data from a SAM record
-This is pretty tricky:
-
-* 
-
-
-
-=#
-
+# TODO: Figure out how this should be constructed
 mutable struct BAMWriter{T <: AbstractBufWriter}
     const writer::BGZFWriter{T}
     const ref_lens::Vector{Int32}
     const ref_names::StringVec
     const offset_of_refname::Dict{StringView{ImmutableMemoryView{UInt8}}, UInt32}
-    record::BAMRecord{BAMWriter, T}
+    record::BAMRecord{BAMWriter{T}}
 
     global function new_bam_writer(
             writer::BGZFWriter{T},
+            ref_lens::Vector{Int32},
+            ref_names::StringVec,
             offset_of_refname::Dict{StringView{ImmutableMemoryView{UInt8}}, UInt32},
         ) where {T}
-        w = new{T}(writer, offset_of_refname)
-        record = new_uninitialized_record(T, BAMWriter, w, UInt8[])
+        w = new{T}(writer, ref_lens, ref_names, offset_of_refname)
+        record = new_uninitialized_record(w, UInt8[])
         w.record = reset!(record)
         return w
     end
@@ -688,6 +708,8 @@ function BAMWriter(
     return BAMWriter(bgzf, header, refnames, reflens)
 end
 
+# TODO: Reconsider how this should be constructed. Currently, the header
+# can conflict with refnames and reflens. That doesn't make sense, is bad API.
 function BAMWriter(
         writer::BGZFWriter{T},
         header::ImmutableMemoryView{UInt8},
@@ -759,6 +781,10 @@ function Base.show(io::IO, ::MIME"text/plain", writer::BAMWriter)
     return print(io, "TODO!")
 end
 
+function Base.close(writer::BAMWriter)
+    return close(writer)
+end
+
 function Base.write(writer::BAMWriter, record::BAMRecord)
     # Write fixed bytes
     buffer = get_buffer(writer)
@@ -783,33 +809,76 @@ function Base.write(writer::BAMWriter, record::BAMRecord)
     return BAM_FIXED_BYTES + write(writer.writer, record.data)
 end
 
+function store_dummy_bamcigar!(mem::MutableMemoryView{UInt8}, l_seq::UInt32, l_ref::UInt32)
+    max(l_seq, l_ref) > 0x0fff_ffff && error() # TODO
+    length(mem) == 8 || error() # TODO
+    GC.@preserve mem begin
+        ptr = Ptr{UInt32}(pointer(mem))
+        unsafe_store!(ptr, htol((l_seq << 4 | 0x04)))
+        unsafe_store!(ptr + 4, htol((l_ref << 4 | 0x03)))
+    end
+    return nothing
+end
+
+function get_index_of_refname(record::BAMRecord{<:BAMWriter}, name::Union{AbstractString, Nothing})
+    name === nothing && return Int32(-1)
+    id = get(record.reader_or_writer.offset_of_refname, name, nothing)
+    return if id === nothing
+        error() # TODO: Throw a XAM error
+    else
+        Int32(id)
+    end
+end
 
 function Base.copy!(dst::BAMRecord{<:BAMWriter}, src::SAMRecord)
-    # Compute src cigar
-    # TODO: Be able to store it in the AUX tag
-    c = cigar(src)
-    if c === nothing
-        dst.n_cigar_op = 0
-    elseif c isa XAMError
+    # Copy over basic fields
+    dst.pos = (src.pos - 1) % Int32
+    dst.next_pos = (src.pnext - 1) % Int32
+    dst.mapq = src.mapq
+    dst.flags = src.flags
+    dst.tlen = src.tlen
+
+    # Reference IDs
+    dst.refID = get_index_of_refname(dst, reference_name(src))
+    dst.next_refID = get_index_of_refname(dst, next_reference_name(src))
+
+    # Mapping span and bin
+    dst.bin = let
+        ms = mapping_span(src)
+        if ms === nothing
+            UInt16(4680)
+        else
+            span = (first(ms) % Int32):(last(ms) % Int32)
+            reg2bin(span)
+        end
+    end
+
+    # Set dst.n_cigar_op, handling if there is more than typemax(UInt16) ops,
+    # in which case specs say to store a particularly dummy value of 2 ops,
+    # then store it in the aux. Here, we simply store if the cigar is too big,
+    # and dst.n_cigar_op
+    cig = cigar(src)
+    cigar_too_big = false
+    dst.n_cigar_op = if cig === nothing
+        0
+    elseif cig isa XAMError
         throw(XAMErrors.invalid_cigar) # TODO: Real error <: Exception type
     else
-        dst.n_cigar_op = length(c)
+        cigar_too_big = length(cig) > typemax(UInt16)
+        # If CIGAR is to big, we store this dummy value and store the real cigar in an AUX tag
+        cigar_too_big ? UInt16(2) : length(cig) % UInt16
     end
 
+    # Sequence length
     seq = sequence(src)
-    dst.l_seq = if seq !== nothing
-        length(seq) % UInt32
-    else
-        0
-    end
+    dst.l_seq = seq === nothing ? 0 : length(seq) % UInt32
 
-    # Resize dst's vector to hold all variable-length fields, except auxdata,
-    # which we add later
+    # Resize dst's vector to hold all variable-length fields, except auxdata, which we add later
     v_len = src.qname_len + 1 + 4 * dst.n_cigar_op + ((dst.l_seq + 1) >>> 1) + dst.l_seq
     resize!(dst.data, v_len)
     mem = MemoryView(dst.data)
 
-    # Copy over qname + zero
+    # Copy over qname + trailing zero byte
     qname = query_name(src)
     if qname === nothing
         mem[1] = UInt8('*')
@@ -823,10 +892,19 @@ function Base.copy!(dst::BAMRecord{<:BAMWriter}, src::SAMRecord)
     end
     offset = dst.l_read_name
 
-    # Copy over cigar
-    if c isa CIGAR
-        dst.cigar = BAMCIGAR(mem[(offset + 1):end], c)
-        offset += 4 * dst.n_cigar_op
+    # Copy over cigar, either the dummy value if it's too big, or else the actuial cihar
+    if cig isa CIGAR
+        if cigar_too_big
+            # If c isa CIGAR, the record must be mapped, and so refID cannot be negative.
+            reflen = dst.reader_or_writer.ref_lens[dst.refID + 1]
+            store_dummy_bamcigar!(mem[(offset + 1):(offset + 8)], dst.l_seq, reflen % UInt32)
+            dst.cigar = Uninit()
+            offset += 8
+        else
+            dst_mem = mem[(offset + 1):(offset + 4 * dst.n_cigar_op)]
+            dst.cigar = CIGARStrings.encode!(dst_mem, BAMCIGAR, cig)
+            offset += 4 * dst.n_cigar_op
+        end
     end
 
     # Copy over sequence
@@ -836,10 +914,9 @@ function Base.copy!(dst::BAMRecord{<:BAMWriter}, src::SAMRecord)
     end
 
     # Copy over quality
-    qual = quality(src)
-    if qual === nothing
-        seq === nothing || error() # TODO
-    else
+    qual = quality_scores(src)
+    if qual !== nothing
+        seq === nothing && error() # TODO
         v = mem[(offset + 1):end]
         cu = codeunits(qual)
         for i in eachindex(cu, v)
@@ -853,49 +930,169 @@ function Base.copy!(dst::BAMRecord{<:BAMWriter}, src::SAMRecord)
         copy!(dst_aux, aux_data(src))
     end
 
-    bin = let
-        ms = mapping_span(src)
-        if ms === nothing
-            UInt16(4680)
-        else
-            span = (first(ms) % Int32):(last(ms) % Int32)
-            reg2bin(span)
+    # If cigar was too big, we copy over its binary encoding to the AUX directly here.
+    if cigar_too_big
+        cig isa CIGAR || throw(AssertionError())
+        aux = aux_data(dst)
+        if haskey(aux, AuxTag("CG"))
+            error() # TODO
+        end
+
+        # Manually write the cigar in, without allocating an array
+        cigar_len = 4 * length(cig) + 6
+        oldlen = length(dst.data)
+        resize!(dst.data, oldlen + cigar_len)
+        mem = MemoryView(dst.data)[(oldlen + 1):end]
+        mem[1] = UInt8('B')
+        mem[2] = UInt8('i')
+        GC.@preserve mem begin
+            ptr = Ptr{UInt32}(pointer(mem)) + 2
+            unsafe_store!(ptr, UInt32(cigar_len))
+            for element in c
+                u = reinterpret(UInt8, element.op) % UInt32
+                u |= (element.len % UInt32) << 4
+                ptr += 4
+                unsafe_store!(ptr, u)
+            end
         end
     end
-    dst.bin = bin
 
-    # Mapping span and bin # TODO
-
-
-    # Copy over remaining fields
+    # Finally, the total block size can be computed
     dst.block_size = (length(dst.data) + BAM_FIXED_BYTES - 4) % UInt32
-    refname = reference_name(src)
-    dst.refID = if refname === nothing
-        -1
+
+    return dst
+end
+
+function append_number_field!(
+        data::Vector{UInt8},
+        n::Unsigned,
+        max_digits::Int
+    )::Int
+    old_len = length(data)
+    resize!(data, old_len + max_digits + 1)
+    n = inbounds_write_base10!(@inbounds(MemoryView(data)[(old_len + 1):end]), n)
+    resize!(data, old_len + n + 1)
+    @inbounds data[end] = UInt8('\t')
+    return old_len + n + 1
+end
+
+min_string(::Int64) = "-9223372036854775808"
+min_string(::Int32) = "-2147483648"
+
+function append_number_field!(
+        data::Vector{UInt8},
+        n::Union{Int32, Int64},
+        max_digits::Int
+    )::Int
+    if n == typemin(n)
+        s = min_string(typemin(n))
+        old_len = length(data)
+        sizehint!(data, old_len + sizeof(s) + 1; shrink = true)
+        append!(data, codeunits(s))
+        @inbounds data[end] = UInt8('\t')
     else
-        refid = get(dst.reader_or_writer.offset_of_refname, refname, nothing)
-        if refid === nothing
-            error() # TODO: Throw a XAM error
-        else
-            refid
+        if n < zero(n)
+            push!(data, UInt8('-'))
         end
+        return append_number_field!(data, unsigned(abs(n)), max_digits) + (n < zero(n))
     end
-    next_refname = next_reference_name(src)
-    dst.next_refID = if next_refname === nothing
-        -1
+end
+
+function append_optional_string_field!(data::Vector{UInt8}, field::Union{Nothing, AbstractString})::Int
+    cu = if field === nothing
+        push!(data, UInt8('*'))
+        1
     else
-        refid = get(dst.reader_or_writer.offset_of_refname, next_refname, nothing)
-        if refid === nothing
-            error() # TODO: Throw a XAM error
-        else
-            refid
-        end
+        append!(data, codeunits(field))
+        ncodeunits(field)
     end
-    dst.pos = (src.pos - 1) % Int32
-    dst.next_pos = (src.pnext - 1) % Int32
-    dst.mapq = src.mapq
+    push!(data, UInt8('\t'))
+    return cu + 1
+end
+
+function Base.copy!(dst::SAMRecord, src::BAMRecord)
+    data = dst.data
+    empty!(data)
+
+    # QNAME
+    n = append_optional_string_field!(data, query_name(src))
+    dst.qname_len = (n % UInt8) - 0x01
+
+    # FLAG
+    append_number_field!(data, src.flags.x, 5)
     dst.flags = src.flags
+
+    # RNAME
+    rname_start = (length(data) + 1) % UInt32
+    rname_len_p1 = append_optional_string_field!(data, reference_name(src))
+    dst.rname_span = (rname_start, (rname_start + rname_len_p1 - 1) % UInt32)
+
+    # POS
+    dst.pos = src.pos + UInt32(1)
+    append_number_field!(data, dst.pos, 10)
+
+    # MAPQ
+    append_number_field!(data, src.mapq, 10)
+    dst.mapq = src.mapq
+
+    # CIGAR
+    dst.cigar_offset = length(data) % UInt32
+    cig = cigar(src)
+    if cig isa CIGARError
+        throw(XAMErrors.invalid_cigar)
+    elseif cig === nothing
+        push!(data, UInt8('*'))
+    else
+        dst.cigar = CIGARStrings.encode_append!(data, CIGAR, cig)
+    end
+    push!(data, UInt8('\t'))
+
+    # RNEXT
+    if src.refID == src.next_refID
+        # If RNAME and RNEXT is the same, we write it as `=`
+        idx = length(data + 1) % UInt32
+        dst.rnext_span = (idx, idx)
+        push!(data, UInt8("="))
+        push!(data, UInt8("\t"))
+    else
+        rnext_start = (length(data) + 1) % UInt32
+        rnext_name_len_p1 = append_optional_string_field!(data, next_reference_name(src))
+        dst.rnext_span = (rnext_start, (rnext_start + rnext_name_len_p1 - 1) % UInt32)
+    end
+
+    # PNEXT
+    dst.pnext = src.next_pos + UInt32(1)
+    append_number_field!(data, dst.pnext, 10)
+
+    # TLEN
     dst.tlen = src.tlen
+    append_number_field!(data, src.tlen, 10)
+
+    # SEQ
+    dst.seq_offset = length(data) % UInt32
+    append_optional_string_field!(data, sequence(src))
+
+    # QUAL
+    dst.qual_offset = length(data) % UInt32
+    qual = quality_scores(src)
+    if qual === nothing
+        push!(data, UInt8('*'))
+    else
+        old_len = length(data)
+        resize!(data, old_len + length(qual))
+        for (i, byte) in enumerate(qual)
+            data[old_len + i] = byte + UInt8(33)
+        end
+    end
+
+    # Auxiliary fields
+    dst.aux_offset = (length(data) + 1) % UInt32 # compensate for tab
+    src_aux = aux_data(src)
+    if !isempty(src_aux)
+        push!(data, UInt8('\t'))
+        dst_aux = XAMAuxData.SAM.Auxiliary(data, length(data) + 1)
+        copy!(dst_aux, src_aux)
+    end
 
     return dst
 end
