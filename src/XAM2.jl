@@ -14,6 +14,7 @@ using BufferIO: BufferIO,
     line_views
 
 using MemoryViews:
+    MemoryViews,
     ImmutableMemoryView,
     MemoryView,
     MutableMemoryView,
@@ -54,15 +55,38 @@ export BAMRecord,
     is_mapped,
     is_first,
     is_last,
-    mapping_span
+    mapping_span,
+    XAMError,
+    XAMErrorKind,
+    XAMErrors
 
-public try_parse_record!,
-    HasEq
+public try_parse!,
+    HasEq,
+    SAMHeaderError
+try_parse_header,
 
 
+    """
+        module XAMErrors
+
+    This module is used as a namespace for the [`XAMErrorKind`](@ref) enum.
+    """
 module XAMErrors
 
-    @enum XAMError::UInt8 begin
+    """
+        XAMErrorKind
+
+    Enum that contains information about a [`XAMError`](@ref).
+    New variants may be added in future, minor releases.
+    The integer value of these kinds are not stable over minor releases.
+
+    julia> kind = XAMErrors.invalid_cigar;
+
+    julia> throw(XAMError(kind))
+    ERROR:
+    [...]
+    """
+    @enum XAMErrorKind::UInt8 begin
         truncated_file
         invalid_block_length
         closed_stream
@@ -81,7 +105,32 @@ module XAMErrors
     end
 end # module XAMErrors
 
-using .XAMErrors: XAMError
+using .XAMErrors: XAMErrorKind
+
+"""
+    XAMError <: Exception
+
+An exception thrown when reading or writing invalid SAM or BAM data.
+
+Instances of this error has a public `.kind` property of type
+`XAMErrorKind`. You can use this programmatically check the kind
+of exception.
+"""
+struct XAMError <: Exception
+    kind::XAMErrorKind
+end
+
+@noinline throw_xam_error(kind::XAMErrorKind) = throw(XAMError(kind))
+
+function Base.showerror(io::IO, error::XAMError)
+    kind = error.kind
+    s = if kind == XAMErrors.truncated_file
+        "Input data too is truncated; does not contain whole record or header"
+    elseif kind == XAMErrors.invalid_block_length
+        unreachable()
+    end
+    return print(io, s)
+end
 
 struct Uninit end
 
@@ -277,7 +326,6 @@ Seek `reader` back to the first record.
 """
 function seek_first_record end
 
-
 include("flags.jl")
 include("stringvec.jl")
 include("header.jl")
@@ -301,8 +349,11 @@ const XAMReader = Union{SAMReader, BAMReader}
 Return the query name (QNAME) of `record`, or `nothing` if the data
 is not available.
 
-The name is returned as a UTF-8 encoded `AbstractString` which aliases
-the record.
+The name is returned as a UTF-8 encoded `AbstractString`.
+
+!!! warning
+    The returned string aliases the record. Mutating the record will
+    invalidate the string.
 """
 function query_name end
 
@@ -312,12 +363,16 @@ function query_name end
 Return the reference name (RNAME) of `record`, or `nothing` if the data
 is not available.
 
-The name is returned as a UTF-8 encoded `AbstractString`. For
-`SAMRecord`, this aliases the record, whereas for `BAMRecord`,
-the data aliases the owning `BAMReader` or `BAMWriter`.
+The name is returned as a UTF-8 encoded `AbstractString`.
 
 For `SAMRecord`, this function does _not_ validate that the reference
 name is present in the SAM header.
+
+!!! warning
+    For `SAMRecord`, this aliases the record, whereas for `BAMRecord`,
+    the data aliases the owning `BAMReader` or `BAMWriter`.
+    Mutating the underlying record will invalidate the string if returned
+    from a `SAMRecord`
 """
 function reference_name end
 
@@ -327,12 +382,13 @@ function reference_name end
 Return the reference name of the next segment in the template (RNEXT) of `record`,
 or `nothing` if the data is not available.
 
-The name is returned as a UTF-8 encoded `AbstractString`. For
-`SAMRecord`, this aliases the record, whereas for `BAMRecord`,
-the data aliases the owning `BAMReader` or `BAMWriter`.
+The name is returned as a UTF-8 encoded `AbstractString`.
 
-For `SAMRecord`, this function does _not_ validate that the reference
-name is present in the SAM header.
+!!! warning
+    For `SAMRecord`, this aliases the record, whereas for `BAMRecord`,
+    the data aliases the owning `BAMReader` or `BAMWriter`.
+    Mutating the underlying record will invalidate the string if returned
+    from a `SAMRecord`
 """
 function next_reference_name end
 
@@ -363,6 +419,10 @@ or a `CIGARStrings.CIGARError` if the cigar is malformed.
 This operation will validate the underlying data, and then cache
 the constructed cigar such that subsequent calls to this function
 is almost free.
+
+!!! warning
+    The returned `AbstractCIGAR` object aliases the record.
+    Mutating the record will invalidate the cigar.
 """
 function cigar end
 
@@ -431,7 +491,6 @@ struct Reference
     name::StringView{ImmutableMemoryView{UInt8}}
     len::Int
 end
-
 
 """
     try_sequence(::Type{LongDNA{4}}, rec::BAMRecord)::Union{Nothing, HasEq, LongDNA{4}}

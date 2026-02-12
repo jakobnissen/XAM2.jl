@@ -212,7 +212,7 @@ mutable struct BAMReader{T <: AbstractBufReader}
     const header::SAMHeader
     const offset_first_record::VirtualOffset
     const copy::Bool
-    error::Union{Nothing, XAMError}
+    error::Union{Nothing, XAMErrorKind}
 
     # These must be the last field so we can use a hack to initialize
     # the record and the reader at the same time.
@@ -266,7 +266,7 @@ end
 function Base.iterate(reader::BAMReader, _::Nothing = nothing)
     result = try_read!(reader)
     result === nothing && return nothing
-    isa(result, XAMError) && throw(result)
+    isa(result, XAMErrorKind) && throw_xam_error(result)
     record = reader.copy ? copy(result) : result
     return (record, nothing)
 end
@@ -310,7 +310,7 @@ function parse_bam_header!(
         reader::BGZFReader,
         buffer::Vector{UInt8}
     )::Union{
-        XAMError, @NamedTuple{
+        SAMHeaderError, XAMError, @NamedTuple{
             header::SAMHeader,
             stringvec::StringVec,
             reflens::Vector{Int32},
@@ -332,8 +332,8 @@ function parse_bam_header!(
     # Copy the header because we need to store the data in the reader
     header_view = copy(@inbounds(memview[1:(end - 4)]))
 
-    # TODO: This can throw. Is that alright? How do we handle it?
-    header = parse_header(header_view)
+    header = try_parse_header(header_view)
+    header isa SAMHeaderError && return header
     stringvec = StringVec()
     reflens = Int32[]
 
@@ -390,6 +390,16 @@ end
 function BAMReader(io::Union{IO, AbstractBufReader}; copy::Bool = true, n_workers::Int = Threads.nthreads())
     reader = BGZFReader(io; n_workers)
     return new_bam_reader(reader, copy)
+end
+
+
+function BAMReader(f::Function, args...; kwargs...)
+    return try
+        reader = BAMReader(args...; kwargs...)
+        f(reader)
+    finally
+        close(reader)
+    end
 end
 
 function Base.show(io::IO, reader::BAMReader)
@@ -498,6 +508,10 @@ The returned `AbstractString`'s type is an implementation detail, but it is guar
 * Backed by a view into the existing data of the record (so not separately allocated)
 * Contain at least 1 codeunit, and having the codeunit type `UInt8`.
 * Containing only the `Char`s `"=ACMGRSVTWYHKDBN"` encoded in ASCII
+
+!!! warning
+    The returned sequence aliases the record. Mutating the record will
+    invalidate the sequence
 """
 function sequence(record::BAMRecord)::Union{BAMSeq, Nothing}
     iszero(record.l_seq) && return nothing
@@ -515,6 +529,10 @@ missing (set to all `0xFF`)
 
 Note that the returned quality does not have a PHRED offset, so e.g. a PHRED
 score of 31 is encoded as `UInt8(31)` as opposed to e.g. `UInt8(31 + 33)`.
+
+!!! warning
+    The returned array aliases the record. Mutating the record will
+    invalidate the array
 """
 function quality_scores(record::BAMRecord)::Union{Nothing, ImmutableMemoryView{UInt8}}
     seq_bytes = (record.l_seq + 1) >> 1
@@ -535,6 +553,10 @@ end
 Return the auxiliary data as a mutable `XAMAuxData.BAM.Auxiliary`.
 If the record does not contain any auxiliary fields, the returned object
 is empty.
+
+!!! warning
+    The returned `Auxiliary` object aliases the record.
+    Mutating the record will invalidate the auxiiary data.
 
 See the documentation of `XAMAuxData.BAM.Auxiliary` for more details.
 """
@@ -613,17 +635,17 @@ function unsafe_load_fixed_fields(record::BAMRecord, buffer::ImmutableMemoryView
 end
 
 """
-    XAM2.try_read(reader::BAMReader)::Union{BAMRecord, Nothing, XAMError}
+    XAM2.try_read(reader::BAMReader)::Union{BAMRecord, Nothing, XAMErrorKind}
 
 Attempt to read the next record of `reader`, similar to iterating the reader.
 If the reader is EOF, return `nothing`.
-If the next record is malformed, return a `XAMError`.
-Once this function returns a `XAMError`, subsequent calls to this function
+If the next record is malformed, return a `XAMErrorKind`.
+Once this function returns a `XAMErrorKind`, subsequent calls to this function
 will return the same error until the reader is closed or seeked.
 
 This function does not throw if the reader's data is malformed.
 """
-function try_read!(x::BAMReader)::Union{BAMRecord, Nothing, XAMError}
+function try_read!(x::BAMReader)::Union{BAMRecord, Nothing, XAMErrorKind}
     isnothing(x.error) || return x.error
 
     # Check if EOF and return that error if so
@@ -769,6 +791,15 @@ function BAMWriter(
     return new_bam_writer(writer, ref_lens, stringvec, offset_of_refname)
 end
 
+function BAMWriter(f::Function, args...; kwargs...)
+    return try
+        writer = BAMWriter(args...; kwargs...)
+        f(writer)
+    finally
+        close(writer)
+    end
+end
+
 function Base.show(io::IO, writer::BAMWriter)
     print(io, '<')
     summary(io, writer)
@@ -861,8 +892,8 @@ function Base.copy!(dst::BAMRecord{<:BAMWriter}, src::SAMRecord)
     cigar_too_big = false
     dst.n_cigar_op = if cig === nothing
         0
-    elseif cig isa XAMError
-        throw(XAMErrors.invalid_cigar) # TODO: Real error <: Exception type
+    elseif cig isa XAMErrorKind
+        throw_xam_error(XAMErrors.invalid_cigar)
     else
         cigar_too_big = length(cig) > typemax(UInt16)
         # If CIGAR is to big, we store this dummy value and store the real cigar in an AUX tag
@@ -1039,7 +1070,7 @@ function Base.copy!(dst::SAMRecord, src::BAMRecord)
     dst.cigar_offset = length(data) % UInt32
     cig = cigar(src)
     if cig isa CIGARError
-        throw(XAMErrors.invalid_cigar)
+        throw_xam_error(XAMErrors.invalid_cigar)
     elseif cig === nothing
         push!(data, UInt8('*'))
     else

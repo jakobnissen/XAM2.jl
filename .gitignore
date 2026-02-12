@@ -3,3 +3,5 @@ Manifest.toml
 docs/build
 LocalPreferences.toml
 *code-workspace
+*.sam
+*.bam

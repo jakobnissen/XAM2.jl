@@ -64,7 +64,7 @@ These are expected at `../Automa.jl`, `../BGZFLib.jl`, etc. relative to this rep
 
 ## Error Handling
 
-Errors are represented as `XAMError` enum values (not exceptions) returned from parsing functions like `try_read!`. The iterator (`Base.iterate`) converts these to thrown errors. Reader objects store the first error in an `error` field and refuse further reads after an error.
+Errors use a two-level design: `XAMErrorKind` is a `@enum` of error kinds (not an exception) returned from non-throwing functions like `try_read!`. `XAMError <: Exception` wraps a `XAMErrorKind` and is the throwable type. Use `throw_xam_error(kind)` to construct and throw. The iterator (`Base.iterate`) converts returned `XAMErrorKind` values to thrown `XAMError`s. Reader objects store the first error kind in an `error` field and refuse further reads after an error.
 
 ## Julia Version
 

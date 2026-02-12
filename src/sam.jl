@@ -112,7 +112,8 @@ const SAM_ACTIONS = Dict{Symbol, Expr}(
 
 A `SAMRecord` represents a non-header line of a SAM file.
 
-This type is semi-lazily validated.
+This type is semi-lazily validated; some fields, such as the sequence, quality and CIGAR
+will not be validated until queries.
 
 Construct a valid, but empty record with `SAMRecord()`.
 
@@ -120,6 +121,20 @@ Construct a valid, but empty record with `SAMRecord()`.
     Mutating its backing memory will invalidate the record and
     lead to logic bugs and garbage results, but should never cause
     undefined behaviour in the absence of data races
+
+# Examples
+```jldoctest
+julia> empty_rec = SAMRecord();
+
+julia> is_mapped(empty_rec)
+false
+
+julia> query_name(empty_rec) === nothing
+true
+
+julia> aux_data(empty_rec) |> isempty
+true
+```
 """
 mutable struct SAMRecord
     # Data contains the unmodified input line.
@@ -148,16 +163,18 @@ mutable struct SAMRecord
 end
 
 """
-    XAM2.try_parse_record!(
+    XAM2.try_parse!(
         record::SAMRecord,
         data::ImmutableMemoryView{UInt8}
-    )::Union{SAMRecord, XAMError}
+    )::Union{SAMRecord, XAMErrorKind}
 
 Parse the line `data` as a SAM record into `record`, returning it.
 If the data is invalid, `record` is will be in an invalid state,
-and return a `XAMError`.
+and return a `XAMErrorKind`.
 """
-@eval function try_parse_record!(record::SAMRecord, data::ImmutableMemoryView{UInt8})
+function try_parse(::SAMRecord, ::ImmutableMemoryView{UInt8}) end
+
+@eval function try_parse!(record::SAMRecord, data::ImmutableMemoryView{UInt8})
     length(data) > typemax(UInt32) && return XAMErrors.line_too_long
     empty!(record.data)
     append!(record.data, data)
@@ -172,6 +189,17 @@ and return a `XAMError`.
         record.aux_offset = length(data) % UInt32
     end
     return record
+end
+
+"""
+    parse!(record::SAMRecord, data::ImmutableMemoryView{UInt8})::SAMRecord
+
+Parse the `data` into a `record`, or throw a `XAMError` if the data is invalid.
+"""
+function parse!(record::SAMRecord, data::ImmutableMemoryView{UInt8})
+    result = try_parse!(record, data)
+    result isa XAMErrorKind && throw_xam_error(result)
+    return result
 end
 
 SAMRecord() = reset!(new_uninitialized_sam_record(UInt8[]))
@@ -374,6 +402,18 @@ function next_reference_name(record::SAMRecord)::Union{Nothing, AbstractString}
     end
 end
 
+"""
+    sequence(record::SAMRecord)::Union{AbstractString, Nothing}
+
+Get the query sequence of `rec` as an `AbstractString`, or
+`nothing` if the sequence is not available.
+
+The sequence is a UTF-8 encoded view into the record.
+
+!!! warning
+    The returned sequence aliases the record.
+    Mutating the record will invalidate the sequence.
+"""
 function sequence(record::SAMRecord)::Union{AbstractString, Nothing}
     view = ImmutableMemoryView(record.data)
     view = view[(record.seq_offset + 1):(record.qual_offset - 1)]
@@ -387,8 +427,12 @@ end
 """
     quality_string(record::SAMRecord)::Union{Nothing, AbstractString}
 
-Return the quality as a PHRED+33-encoded `AbstractString` aliasing the record,
+Return the quality as a PHRED+33-encoded `AbstractString`,
 or `nothing` if the quality is not available.
+
+!!! warning
+    The returned string aliases the record.
+    Mutating the record will invalidate the quality string.
 """
 function quality_string(record::SAMRecord)::Union{Nothing, AbstractString}
     view = ImmutableMemoryView(record.data)
@@ -406,6 +450,10 @@ end
 Return the auxiliary data as a mutable `XAMAuxData.SAM.Auxiliary`.
 If the record does not contain any auxiliary fields, the returned object
 is empty.
+
+!!! warning
+    The returned `Auxiliary` object aliases the record.
+    Mutating the record will invalidate the auxiiary data.
 
 See the documentation of `XAMAuxData.SAM.Auxiliary` for more details.
 """
@@ -447,7 +495,7 @@ mutable struct SAMReader{T <: AbstractBufReader}
     const offset_first_record::Int
     const header::SAMHeader
     const copy::Bool
-    error::Union{Nothing, XAMError}
+    error::Union{Nothing, XAMErrorKind}
 end
 
 function SAMReader(reader::AbstractBufReader; copy::Bool = true)
@@ -460,9 +508,19 @@ function SAMReader(io::IO; copy::Bool = true)
     return SAMReader(BufReader(io); copy)
 end
 
-# TODO: For both reader and writer
-# TODO: Close
-# TODO: open(do) method
+function SAMReader(f::Function, args...; kwargs...)
+    return try
+        reader = SAMReader(args...; kwargs...)
+        f(reader)
+    finally
+        close(reader)
+    end
+end
+
+function Base.close(reader::SAMReader)
+    close(reader.reader)
+    return reader.error = nothing
+end
 
 get_header(reader::SAMReader) = reader.header
 
@@ -493,7 +551,9 @@ function read_initial_sam_header!(reader::AbstractBufReader)
     end
     data = get_unflushed(buffer)
     offset = length(data)
-    return (parse_header(ImmutableMemoryView(data)), offset)
+    header = try_parse_header(ImmutableMemoryView(data))
+    header isa SAMHeaderError && throw(header)
+    return (header, offset)
 end
 
 function seek_first_record(reader::SAMReader)
@@ -505,23 +565,23 @@ end
 function Base.iterate(reader::SAMReader, _::Nothing = nothing)
     result = try_read!(reader)
     result === nothing && return nothing
-    isa(result, XAMError) && throw(result)
+    isa(result, XAMErrorKind) && throw_xam_error(result)
     record = reader.copy ? copy(result) : result
     return (record, nothing)
 end
 
 """
-    XAM2.try_read(reader::SAMReader)::Union{SAMRecord, Nothing, XAMError}
+    XAM2.try_read(reader::SAMReader)::Union{SAMRecord, Nothing, XAMErrorKind}
 
 Attempt to read the next record of `reader`, similar to iterating the reader.
 If the reader is EOF, return `nothing`.
-If the next record is malformed, return a `XAMError`.
-Once this function returns a `XAMError`, subsequent calls to this function
+If the next record is malformed, return a `XAMErrorKind`.
+Once this function returns a `XAMErrorKind`, subsequent calls to this function
 will return the same error until the reader is closed or seeked.
 
 This function does not throw if the reader's data is malformed.
 """
-function try_read!(reader::SAMReader)::Union{SAMRecord, Nothing, XAMError}
+function try_read!(reader::SAMReader)::Union{SAMRecord, Nothing, XAMErrorKind}
     # Get a view of the current line, stripped from newline
     isnothing(reader.error) || return reader.error
     line_view = get_next_line_view(reader.reader)
