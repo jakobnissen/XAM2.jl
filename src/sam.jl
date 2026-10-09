@@ -204,7 +204,7 @@ end
 
 SAMRecord() = reset!(new_uninitialized_sam_record(UInt8[]))
 
-const DEFAULT_SAM_DATA_CONTENT = to_memory(collect(b"*\t4\t*\t0\t255\t*\t*\t0\t0\t*\t*"))
+const DEFAULT_SAM_DATA_CONTENT = Tuple(b"*\t4\t*\t0\t255\t*\t*\t0\t0\t*\t*")
 
 const SAM_RECORD_CONTENT = [
     0x05, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, # rname_span: 5:5
@@ -219,7 +219,7 @@ const SAM_RECORD_CONTENT = [
     0x04, 0x00, # flags: unmapped
     0xff, # mapq: unavailable,
     0x00, # qname_len
-] |> to_memory
+] |> Tuple
 
 
 const FIXED_SAM_OFFSET = fieldoffset(SAMRecord, 3)
@@ -229,10 +229,10 @@ const FIXED_SAM_SIZE = 48
 @assert sizeof(SAM_RECORD_CONTENT) == FIXED_SAM_SIZE
 
 function reset_fixed_fields!(record::SAMRecord)
-    GC.@preserve record SAM_RECORD_CONTENT begin
-        dst = Ptr{UInt8}(pointer_from_objref(record)) + FIXED_SAM_OFFSET
-        src = pointer(SAM_RECORD_CONTENT)
-        @ccall memcpy(dst::Ptr{UInt8}, src::Ptr{UInt8}, Csize_t(FIXED_SAM_SIZE)::Csize_t)::Cvoid
+    # See comment in `reset_fixed_fields!(::BAMRecord)` for why this is a tuple
+    GC.@preserve record begin
+        dst = Ptr{typeof(SAM_RECORD_CONTENT)}(pointer_from_objref(record) + FIXED_SAM_OFFSET)
+        unsafe_store!(dst, SAM_RECORD_CONTENT)
     end
     return record
 end
@@ -244,8 +244,11 @@ Resets the `SAMRecord` to its default state, deleting all information from it.
 After this function, the record is equal to a `SAMRecord()`.
 """
 function reset!(record::SAMRecord)
-    resize!(record.data, length(DEFAULT_SAM_DATA_CONTENT))
-    @inbounds copyto!(MemoryView(record.data), ImmutableMemoryView(DEFAULT_SAM_DATA_CONTENT))
+    data = record.data
+    resize!(data, length(DEFAULT_SAM_DATA_CONTENT))
+    for i in eachindex(data, DEFAULT_SAM_DATA_CONTENT)
+        @inbounds data[i] = @inbounds(DEFAULT_SAM_DATA_CONTENT[i])
+    end
     record.cigar = Uninit()
     return reset_fixed_fields!(record)
 end
@@ -258,7 +261,7 @@ function Base.copy(record::SAMRecord)
         src = Ptr{UInt8}(pointer_from_objref(record)) + FIXED_SAM_OFFSET
         @ccall memcpy(dst::Ptr{UInt8}, src::Ptr{UInt8}, Csize_t(FIXED_SAM_SIZE)::Csize_t)::Cvoid
     end
-    record.cigar = copy_cigar!(record.cigar, record.data, vector_copy)
+    new.cigar = copy_cigar!(record.cigar, record.data, vector_copy)
     return new
 end
 
@@ -509,8 +512,8 @@ function SAMReader(io::IO; copy::Bool = true)
 end
 
 function SAMReader(f::Function, args...; kwargs...)
+    reader = SAMReader(args...; kwargs...)
     return try
-        reader = SAMReader(args...; kwargs...)
         f(reader)
     finally
         close(reader)

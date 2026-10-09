@@ -1,0 +1,13 @@
+@HD	VN:1.6	SO:coordinate
+@SQ	SN:chr1	LN:1000
+@SQ	SN:chr2	LN:500
+@SQ	SN:chr3	LN:2000
+@RG	ID:rg1	SM:sample1
+@PG	ID:prog	PN:prog
+@CO	An example comment
+r1	99	chr1	5	60	4M	=	20	19	ACGT	IIII	RG:Z:rg1	NM:i:0
+r1	147	chr1	20	60	2M1I1M	=	5	-19	TTTA	#$%&
+r2	65	chr1	100	30	3M2S	chr2	50	0	ACGTA	*
+r2	129	chr2	50	30	5M	chr1	100	0	GGGCC	IIIII
+r3	0	chr3	10	255	3M1D2M	*	0	0	ACGTA	IIIII	XA:Z:hello
+r4	4	*	0	0	*	*	0	0	ACG	III

@@ -1,22 +1,22 @@
 """
-    mutable struct BAMRecord{R}
+    mutable struct BAMRecord
 
 A single alignment record in a BAM file.
 
-The type parameter `R` is a concrete subtype of `BAMReader` or `BAMWriter`,
-and represents the owner of the record, which is needed to retrieve information
-on references stored in the record.
+Every record refers to a [`References`](@ref), which is used to look up the
+names and lengths of the references that the record's reference IDs point to.
+Records read from a `BAMReader` share the reader's `References`.
 
 `BAMRecord`s are semi-lazily parsed, and do not e.g. validate their CIGAR
 before access.
 
+    BAMRecord(refs::References)::BAMRecord
     BAMRecord(io::Union{BAMReader, BAMWriter})::BAMRecord
-    
-Create an unmapped, empty (but valid) record referring `io`.
-"""
-mutable struct BAMRecord{R}
-    # R can be reader or writer.
 
+Create an unmapped, empty (but valid) record referring to `refs`, or to the
+references of `io`.
+"""
+mutable struct BAMRecord
     # This data contains, in order, with no unused bytes at the end:
     # 1. Read name including trailing null byte
     # 2. Cigar ops encoded in 32 bits each
@@ -24,9 +24,8 @@ mutable struct BAMRecord{R}
     # 4. Quality
     # 5. Auxiliary data
     const data::Vector{UInt8}
-    # We need a ref here because the refids point back to the header,
-    # stored in the reader/writer
-    const reader_or_writer::R
+    # The reference IDs of the record index into these references
+    const refs::References
 
     # This field is cached. Uninit means: Not computed. Nothing means no cigar.
     # Otherwise, a cigar or invalid data.
@@ -55,11 +54,8 @@ mutable struct BAMRecord{R}
     # 0 if missing, else TLEN as defined in the SAM spec
     tlen::Int32
 
-    global function new_uninitialized_record(
-            reader_or_writer::R,
-            data::Vector{UInt8}
-        ) where {R}
-        return new{R}(data, reader_or_writer, Uninit())
+    global function new_uninitialized_record(refs::References, data::Vector{UInt8})
+        return new(data, refs, Uninit())
     end
 end
 
@@ -76,7 +72,7 @@ const BAM_RECORD_CONTENT = [
     0xff, 0xff, 0xff, 0xff, # unmapped next refid
     0xff, 0xff, 0xff, 0xff, # unmapped next pos
     0x00, 0x00, 0x00, 0x00, # unmapped tlen
-] |> to_memory
+] |> Tuple
 
 const BAM_FIXED_BYTES = length(BAM_RECORD_CONTENT)
 
@@ -178,11 +174,12 @@ end
 
 """
     mutable struct BAMReader{T <: AbstractBufReader}
-    
+
 Lazy, multithreaded reader of BAM files.
 
-`rdr = BAMReader` is an iterator over `BAMRecord{typeof(rdr)}`.
-The header can be obtained with [`get_header`](@ref)
+`rdr = BAMReader` is an iterator over `BAMRecord`.
+The header can be obtained with [`get_header`](@ref), and the reference
+sequences with [`references`](@ref).
 
     BAMReader(
         io::Union{IO, AbstractBufReader};
@@ -205,55 +202,37 @@ The number of decompressing worker tasks is set by `n_workers`, which must be at
 """
 mutable struct BAMReader{T <: AbstractBufReader}
     const reader::BGZFReader{T}
-    # Lens and names in their own fields, because these are accessed far more often
-    # than any other metadata
-    const ref_lens::Vector{Int32}
-    const ref_names::StringVec
+    const refs::References
     const header::SAMHeader
     const offset_first_record::VirtualOffset
     const copy::Bool
+    const record::BAMRecord
     error::Union{Nothing, XAMErrorKind}
-
-    # These must be the last field so we can use a hack to initialize
-    # the record and the reader at the same time.
-    # That's also why it can't be const
-    record::BAMRecord{BAMReader{T}}
-
-    global function new_bam_reader(reader::BGZFReader{T}, copy::Bool) where {T}
-        buffer = UInt8[]
-        # TODO: Handle potential errors - is maybe not SAMHeader, can be error
-        # also, can throw
-        (; header, stringvec, reflens) = parse_bam_header!(reader, buffer)
-        vo_at_first_record = virtual_position(reader)
-
-        result = new{T}(
-            reader,
-            reflens,
-            stringvec,
-            header,
-            vo_at_first_record,
-            copy,
-            nothing
-        )
-        result.record = new_bam_record(result, buffer)
-        return result
-    end
 end
 
-# TODO: For both reader and writer
-# TODO: Close
-# TODO: open(do) method
+function new_bam_reader(reader::BGZFReader{T}, copy::Bool) where {T}
+    buffer = UInt8[]
+    # TODO: Add a non-throwing constructor (see REVIEW.md, section 4)
+    parsed = parse_bam_header!(reader, buffer)
+    parsed isa SAMHeaderError && throw(parsed)
+    parsed isa XAMErrorKind && throw_xam_error(parsed)
+    (; header, refs) = parsed
+    vo_at_first_record = virtual_position(reader)
+    record = new_bam_record(refs, buffer)
+    return BAMReader{T}(reader, refs, header, vo_at_first_record, copy, record, nothing)
+end
 
 get_header(reader::BAMReader) = reader.header
+references(reader::BAMReader) = reader.refs
 
-const FIXED_BAM_OFFSET = fieldoffset(BAMRecord{BAMReader{CursorReader}}, 4)
+const FIXED_BAM_OFFSET = fieldoffset(BAMRecord, 4)
 
 """
     reset!(::BAMRecord)
 
 Resets the `BAMRecord` to its default state, deleting all information from it.
 After this function, the record is equal to an empty record created with
-`BAMRecord(reader_or_writer)`.
+`BAMRecord(record.refs)`.
 """
 function reset!(record::BAMRecord)
     resize!(record.data, 2)
@@ -264,7 +243,7 @@ function reset!(record::BAMRecord)
 end
 
 Base.IteratorSize(::Type{<:BAMReader}) = Base.SizeUnknown()
-Base.eltype(::Type{BAMReader{T}}) where {T} = BAMRecord{BAMReader{T}}
+Base.eltype(::Type{<:BAMReader}) = BAMRecord
 
 function Base.iterate(reader::BAMReader, _::Nothing = nothing)
     result = try_read!(reader)
@@ -275,20 +254,19 @@ function Base.iterate(reader::BAMReader, _::Nothing = nothing)
 end
 
 @inline function reset_fixed_fields!(record::BAMRecord)
-    GC.@preserve BAM_RECORD_CONTENT record begin
-        dst = Ptr{UInt8}(pointer_from_objref(record)) + FIXED_BAM_OFFSET
-        @ccall memcpy(
-            dst::Ptr{Cchar},
-            pointer(BAM_RECORD_CONTENT)::Ptr{Cchar},
-            (BAM_FIXED_BYTES % UInt)::Csize_t,
-        )::Cvoid
+    # Content is stored as a tuple, not as a pointer to a const global `Memory`,
+    # because that pointer may be constant folded, which is invalid in a binary
+    # compiled with juliac.
+    GC.@preserve record begin
+        dst = Ptr{typeof(BAM_RECORD_CONTENT)}(pointer_from_objref(record) + FIXED_BAM_OFFSET)
+        unsafe_store!(dst, BAM_RECORD_CONTENT)
     end
     return record
 end
 
 function Base.copy(record::BAMRecord)
     vector_copy = copy(record.data)
-    cp = new_uninitialized_record(record.reader_or_writer, vector_copy)
+    cp = new_uninitialized_record(record.refs, vector_copy)
     GC.@preserve cp record begin
         dst = Ptr{UInt8}(pointer_from_objref(cp)) + FIXED_BAM_OFFSET
         src = Ptr{UInt8}(pointer_from_objref(record)) + FIXED_BAM_OFFSET
@@ -298,7 +276,7 @@ function Base.copy(record::BAMRecord)
             (BAM_FIXED_BYTES % UInt)::Csize_t,
         )::Cvoid
     end
-    record.cigar = copy_cigar!(record.cigar, record.data, vector_copy)
+    cp.cigar = copy_cigar!(record.cigar, record.data, vector_copy)
     return cp
 end
 
@@ -313,10 +291,9 @@ function parse_bam_header!(
         reader::BGZFReader,
         buffer::Vector{UInt8}
     )::Union{
-        SAMHeaderError, XAMError, @NamedTuple{
+        SAMHeaderError, XAMErrorKind, @NamedTuple{
             header::SAMHeader,
-            stringvec::StringVec,
-            reflens::Vector{Int32},
+            refs::References,
         }
     }
 
@@ -347,21 +324,24 @@ function parse_bam_header!(
         memview = fill_bytes_to_data!(reader, buffer, 4)
         isnothing(memview) && return XAMErrors.header_truncated
 
+        # Name length includes the trailing null byte
         l_name = unsafe_load_integer_le(UInt32, memview, 1)
+        in(l_name, 2:(typemax(Int32) % UInt32)) || return XAMErrors.invalid_reference
+        l_name = l_name % Int
 
         memview = fill_bytes_to_data!(reader, buffer, l_name + 4)
         isnothing(memview) && return XAMErrors.header_truncated
 
-        # Skip null byte
-        push_codeunits!(stringvec, memview[1:(l_name - 1)])
+        @inbounds(memview[l_name]) == 0x00 || return XAMErrors.invalid_reference
+        push_codeunits!(stringvec, @inbounds memview[1:(l_name - 1)])
 
         l_ref = unsafe_load_integer_le(Int32, memview, l_name + 1)
-        l_ref < 1 && return XAMErrors.header_empty_ref
-
         push!(reflens, l_ref)
     end
 
-    return (; header, stringvec, reflens)
+    refs = try_build_references(stringvec, reflens)
+    refs isa XAMErrorKind && return refs
+    return (; header, refs)
 end
 
 function fill_bytes_to_data!(reader::BAMReader, nbytes::Int)::Union{ImmutableMemoryView{UInt8}, Nothing}
@@ -397,8 +377,8 @@ end
 
 
 function BAMReader(f::Function, args...; kwargs...)
+    reader = BAMReader(args...; kwargs...)
     return try
-        reader = BAMReader(args...; kwargs...)
         f(reader)
     finally
         close(reader)
@@ -422,13 +402,13 @@ function Base.close(reader::BAMReader)
     return close(reader.reader)
 end
 
-BAMRecord(reader::BAMReader) = new_bam_record(reader, UInt8[])
+BAMRecord(refs::References) = new_bam_record(refs, UInt8[])
 
-function new_bam_record(reader::BAMReader{T}, v::Vector{UInt8}) where {T}
+function new_bam_record(refs::References, v::Vector{UInt8})
     resize!(v, 2)
     @inbounds v[1] = UInt8('*')
     @inbounds v[2] = 0x00
-    record = new_uninitialized_record(reader, v)
+    record = new_uninitialized_record(refs, v)
     return reset_fixed_fields!(record)
 end
 
@@ -445,31 +425,24 @@ end
 function reference_name(record::BAMRecord)::Union{Nothing, AbstractString}
     record.refID < 0 && return nothing
     id = record.refID + 1
-    return record.reader_or_writer.ref_names[id]
+    return record.refs.names[id]
 end
 
 function next_reference_name(record::BAMRecord)::Union{Nothing, AbstractString}
     record.next_refID < 0 && return nothing
     id = record.next_refID + 1
-    return record.reader_or_writer.ref_names[id]
+    return record.refs.names[id]
 end
 
-function reference(record::BAMRecord)
+function reference(record::BAMRecord)::Union{Nothing, Reference}
     record.refID < 0 && return nothing
-    id = record.refID + 1
-    reader = record.reader_or_writer
-    # TODO: A single boundscheck here?
-    return Reference(
-        reader.ref_names[id],
-        reader.ref_lens[id]
-    )
+    return record.refs[record.refID + 1]
 end
 
 function reference_length(record::BAMRecord)::Union{Int, Nothing}
     record.refID < 0 && return nothing
     id = record.refID + 1
-    reader = record.reader_or_writer
-    return reader.ref_lens[id] % Int
+    return record.refs.lengths[id] % Int
 end
 
 function first_eq_seq_pos(record::BAMRecord)
@@ -600,7 +573,7 @@ end
     return if ((u1 & 0x0f) != 0x04) | ((u2 & 0x0f) != 0x03)
         return false
     else
-        ref_length = record.reader_or_writer.ref_lens[record.refID + 1]
+        ref_length = record.refs.lengths[record.refID + 1]
         ((u1 >> 4) == record.l_seq) & ((u2 >> 4) == ref_length)
     end
 end
@@ -700,103 +673,117 @@ function try_read!(x::BAMReader)::Union{BAMRecord, Nothing, XAMErrorKind}
     return x.record
 end
 
-# TODO: Figure out how this should be constructed
-mutable struct BAMWriter{T <: AbstractBufWriter}
-    const writer::BGZFWriter{T}
-    const ref_lens::Vector{Int32}
-    const ref_names::StringVec
-    const offset_of_refname::Dict{StringView{ImmutableMemoryView{UInt8}}, UInt32}
-    record::BAMRecord{BAMWriter{T}}
+"""
+    mutable struct BAMWriter{T <: AbstractBufWriter}
 
-    global function new_bam_writer(
-            writer::BGZFWriter{T},
-            ref_lens::Vector{Int32},
-            ref_names::StringVec,
-            offset_of_refname::Dict{StringView{ImmutableMemoryView{UInt8}}, UInt32},
-        ) where {T}
-        w = new{T}(writer, ref_lens, ref_names, offset_of_refname)
-        record = new_uninitialized_record(w, UInt8[])
-        w.record = reset!(record)
-        return w
+Writer of BAM files.
+
+    BAMWriter(
+        io::Union{IO, AbstractBufWriter},
+        header::SAMHeader,
+        refs::References = References(header);
+        n_workers::Int = min(4, Threads.nthreads()),
+        compress_level::Int = 6,
+    )::BAMWriter
+
+    BAMWriter(bgzf::BGZFWriter, header::SAMHeader, refs::References = References(header))
+
+Construct a `BAMWriter` writing to `io`, by wrapping `io` in a `BGZFLib.BGZFWriter`.
+The header and references are written immediately.
+Closing the resulting writer will close `io`.
+
+The text of `header` is written verbatim. If `header` contains `@SQ` lines, they must
+match `refs`, else an `ArgumentError` is thrown. If `refs` is not passed, it is
+created from the `@SQ` lines of `header`.
+
+When writing a record, its reference IDs are translated from the record's references
+to the writer's references by reference name. Translation is skipped if the record
+and the writer share the same `References` object, e.g. when constructing the writer
+with `BAMWriter(io, get_header(reader), references(reader))`, or if the two
+`References` have identical content.
+A record cannot be written if its reference is not present in the writer's
+references, or if the reference has a different length in the writer.
+See [`XAM2.try_write`](@ref).
+
+# Examples
+```julia
+BAMReader(open("in.bam")) do reader
+    BAMWriter(open("out.bam", "w"), get_header(reader), references(reader)) do writer
+        for record in reader
+            is_mapped(record) && write(writer, record)
+        end
     end
 end
+```
+"""
+mutable struct BAMWriter{T <: AbstractBufWriter}
+    const writer::BGZFWriter{T}
+    const refs::References
+    # A Record stores a Reference, but what do we do if the Reference of the record
+    # does not match the one in this writer?
+    # Solution: Translate the reference, then cache the translated reference in this
+    # field. This amortizes translation of writes of many reads from a different Reference.
+    # A map of `nothing` means the source has the same content as `refs`.
+    # The `last_*` fields is a single-element cache in front of `maps`.
+    last_src::Union{Nothing, References}
+    last_map::Union{Nothing, Vector{Int32}}
+    const maps::IdDict{References, Union{Nothing, Vector{Int32}}}
+end
+
+references(writer::BAMWriter) = writer.refs
+
+BAMRecord(io::Union{BAMReader, BAMWriter}) = BAMRecord(references(io))
 
 function BAMWriter(
-        writer::Union{AbstractBufWriter, IO},
-        header::ImmutableMemoryView{UInt8},
-        refnames::AbstractVector{<:AbstractString},
-        reflens::AbstractVector{<:Integer};
+        io::Union{AbstractBufWriter, IO},
+        header::SAMHeader,
+        refs::References = References(header);
         n_workers::Int = min(4, Threads.nthreads()),
         compress_level::Int = 6,
     )
-    bgzf = BGZFWriter(writer; n_workers, compress_level)
-    return BAMWriter(bgzf, header, refnames, reflens)
+    # Check before creating the BGZF writer, so we don't leak it if this throws
+    check_writer_header(header, refs)
+    bgzf = BGZFWriter(io; n_workers, compress_level)
+    return BAMWriter(bgzf, header, refs)
 end
 
-# TODO: Reconsider how this should be constructed. Currently, the header
-# can conflict with refnames and reflens. That doesn't make sense, is bad API.
 function BAMWriter(
         writer::BGZFWriter{T},
-        header::ImmutableMemoryView{UInt8},
-        refnames::AbstractVector{<:AbstractString},
-        reflens::AbstractVector{<:Integer},
+        header::SAMHeader,
+        refs::References = References(header),
     ) where {T}
-    if length(header) > typemax(Int32)
-        throw(ArgumentError("Header must be 2147483647 bytes or shorter"))
-    end
-    if length(refnames) != length(reflens)
-        throw(ArgumentError("Length of refnames and reflens must be the same"))
-    end
-    if length(refnames) > typemax(Int32)
-        throw(ArgumentError("BAM format supports at most 2147483647 reference sequences"))
-    end
-    ref_lens = Vector{Int32}(undef, length(reflens))
-    for i in eachindex(ref_lens, reflens)
-        reflen = reflens[i]
-        if reflen < 1 || reflen > typemax(Int32)
-            throw(ArgumentError("Reflen must be in 1:2147483647"))
-        end
-        ref_lens[i] = reflen % Int32
-    end
+    check_writer_header(header, refs)
+    header_text = MemoryView(header)
 
-    # Build the dict of refnames
-    stringvec = StringVec()
-    for refname in refnames
-        cu = codeunits(refname)
-        # Max refname length includes trailing null byte
-        if length(cu) > (typemax(Int32) - 1)
-            throw(ArgumentError("Reference name cannot exceed 2147483646 bytes"))
-        end
-        push_codeunits!(stringvec, cu)
-    end
-    offset_of_refname = Dict{StringView{ImmutableMemoryView{UInt8}}, UInt32}()
-    for i in eachindex(stringvec)
-        offset_of_refname[stringvec[i]] = i - 1
-    end
-
-    @assert length(stringvec) == length(ref_lens)
-
-    # Write the header:
     # Write magic bytes BAM\1
-    write(writer, 0x014d4142)
-    write(writer, length(header) % UInt32)
-    write(writer, header)
-    write(writer, length(refnames) % UInt32)
+    write(writer, htol(0x014d4142))
+    write(writer, htol(length(header_text) % UInt32))
+    write(writer, header_text)
+    write(writer, htol(length(refs) % UInt32))
 
     # Write reference sequences
-    for (refname, ref_len) in zip(stringvec, ref_lens)
-        cu = codeunits(refname)
-        write(writer, (length(cu) + 1) % UInt32)
+    for ref in refs
+        cu = codeunits(ref.name)
+        write(writer, htol((length(cu) + 1) % UInt32))
         write(writer, cu, 0x00)
-        write(writer, ref_len % UInt32)
+        write(writer, htol(ref.length % UInt32))
     end
 
-    return new_bam_writer(writer, ref_lens, stringvec, offset_of_refname)
+    maps = IdDict{References, Union{Nothing, Vector{Int32}}}()
+    return BAMWriter{T}(writer, refs, nothing, nothing, maps)
+end
+
+function check_writer_header(header::SAMHeader, refs::References)::Nothing
+    if length(MemoryView(header)) > typemax(Int32)
+        throw(ArgumentError("Header must be 2147483647 bytes or shorter"))
+    end
+    check_header_references(header, refs)
+    return nothing
 end
 
 function BAMWriter(f::Function, args...; kwargs...)
+    writer = BAMWriter(args...; kwargs...)
     return try
-        writer = BAMWriter(args...; kwargs...)
         f(writer)
     finally
         close(writer)
@@ -815,16 +802,61 @@ function Base.show(io::IO, ::MIME"text/plain", writer::BAMWriter)
     return print(io, "TODO!")
 end
 
-function Base.close(writer::BAMWriter)
-    return close(writer)
+Base.close(writer::BAMWriter) = close(writer.writer)
+Base.flush(writer::BAMWriter) = flush(writer.writer)
+
+"""
+    XAM2.try_write(writer::BAMWriter, record::BAMRecord)::Union{Int, XAMErrorKind}
+
+Write `record` to `writer`, and return the number of bytes written.
+If the record can't be represented using the references of `writer`, write nothing,
+and return an `XAMErrorKind`. This happens if the reference or next reference of
+`record` is not present in `writer`, or if it has a different length in `writer`.
+Errors from the underlying IO are thrown.
+
+See also: [`BAMWriter`](@ref)
+"""
+function try_write(writer::BAMWriter, record::BAMRecord)::Union{Int, XAMErrorKind}
+    src = record.refs
+    map = src === writer.refs ? nothing : reference_map!(writer, src)
+    (ref_id, next_ref_id) = if map === nothing
+        n_refs = length(writer.refs)
+        is_valid_reference_id(record.refID, n_refs) || return XAMErrors.invalid_reference_id
+        is_valid_reference_id(record.next_refID, n_refs) || return XAMErrors.invalid_reference_id
+        (record.refID, record.next_refID)
+    else
+        ref_id = translate_reference_id(map, record.refID)
+        ref_id isa XAMErrorKind && return ref_id
+        next_ref_id = translate_reference_id(map, record.next_refID)
+        next_ref_id isa XAMErrorKind && return next_ref_id
+        (ref_id, next_ref_id)
+    end
+    return write_record(writer, record, ref_id, next_ref_id)
 end
 
 function Base.write(writer::BAMWriter, record::BAMRecord)
-    # Write fixed bytes
-    buffer = get_buffer(writer)
+    result = try_write(writer, record)
+    result isa XAMErrorKind && throw_xam_error(result)
+    return result
+end
+
+is_valid_reference_id(id::Int32, n_refs::Int) = (id ≥ -1) & (id < n_refs)
+
+function reference_map!(writer::BAMWriter, src::References)::Union{Nothing, Vector{Int32}}
+    src === writer.last_src && return writer.last_map
+    map = get!(() -> build_reference_map(src, writer.refs), writer.maps, src)
+    writer.last_src = src
+    writer.last_map = map
+    return map
+end
+
+# Write the record, but with the given reference IDs instead of the record's own.
+function write_record(writer::BAMWriter, record::BAMRecord, ref_id::Int32, next_ref_id::Int32)::Int
+    bgzf = writer.writer
+    buffer = get_buffer(bgzf)
     if length(buffer) < BAM_FIXED_BYTES
-        grow_buffer(writer)
-        buffer = get_buffer(writer)
+        grow_buffer(bgzf)
+        buffer = get_buffer(bgzf)
         # This is unreachable, because calling `grow_buffer` on a BGZFWriter
         # will always make sure the next buffer is a full BGZF block,
         # which is 64 KiB.
@@ -838,9 +870,20 @@ function Base.write(writer::BAMWriter, record::BAMRecord)
             (BAM_FIXED_BYTES % UInt)::Csize_t,
         )::Cvoid
     end
-    @inbounds consume(writer.writer, BAM_FIXED_BYTES)
+    # Byte offsets of refID and next_refID in the fixed fields
+    inbounds_store_le!(buffer, 5, ref_id)
+    inbounds_store_le!(buffer, 25, next_ref_id)
+    @inbounds consume(bgzf, BAM_FIXED_BYTES)
     # Write variable bytes
-    return BAM_FIXED_BYTES + write(writer.writer, record.data)
+    return BAM_FIXED_BYTES + write(bgzf, record.data)
+end
+
+@inline function inbounds_store_le!(mem::MutableMemoryView{UInt8}, i::Int, x::Int32)
+    u = x % UInt32
+    for offset in 0:3
+        @inbounds mem[i + offset] = (u >> (8 * offset)) % UInt8
+    end
+    return nothing
 end
 
 function store_dummy_bamcigar!(mem::MutableMemoryView{UInt8}, l_seq::UInt32, l_ref::UInt32)
@@ -854,17 +897,15 @@ function store_dummy_bamcigar!(mem::MutableMemoryView{UInt8}, l_seq::UInt32, l_r
     return nothing
 end
 
-function get_index_of_refname(record::BAMRecord{<:BAMWriter}, name::Union{AbstractString, Nothing})
+function get_index_of_refname(record::BAMRecord, name::Union{AbstractString, Nothing})
     name === nothing && return Int32(-1)
-    id = get(record.reader_or_writer.offset_of_refname, name, nothing)
-    return if id === nothing
-        error() # TODO: Throw a XAM error
-    else
-        Int32(id)
-    end
+    id = reference_id(record.refs, name)
+    # TODO: Return an error value instead
+    id === nothing && throw_xam_error(XAMErrors.unknown_reference)
+    return id
 end
 
-function Base.copy!(dst::BAMRecord{<:BAMWriter}, src::SAMRecord)
+function Base.copy!(dst::BAMRecord, src::SAMRecord)
     # Copy over basic fields
     dst.pos = (src.pos - 1) % Int32
     dst.next_pos = (src.pnext - 1) % Int32
@@ -930,7 +971,7 @@ function Base.copy!(dst::BAMRecord{<:BAMWriter}, src::SAMRecord)
     if cig isa CIGAR
         if cigar_too_big
             # If c isa CIGAR, the record must be mapped, and so refID cannot be negative.
-            reflen = dst.reader_or_writer.ref_lens[dst.refID + 1]
+            reflen = dst.refs.lengths[dst.refID + 1]
             store_dummy_bamcigar!(mem[(offset + 1):(offset + 8)], dst.l_seq, reflen % UInt32)
             dst.cigar = Uninit()
             offset += 8

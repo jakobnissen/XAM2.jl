@@ -4,13 +4,13 @@ using BufferIO: BufferIO,
     AbstractBufReader,
     AbstractBufWriter,
     BufReader,
-    CursorReader,
     VecWriter,
     get_nonempty_buffer,
     get_unflushed,
     consume,
     fill_buffer,
     get_buffer,
+    grow_buffer,
     line_views
 
 using MemoryViews:
@@ -41,6 +41,8 @@ export BAMRecord,
     XAMRecord,
     push,
     StringVec,
+    References,
+    references,
     get_header,
     query_name,
     flags,
@@ -61,6 +63,8 @@ export BAMRecord,
     XAMErrors
 
 public try_parse!,
+    try_write,
+    Reference,
     try_parse_header,
     HasEq,
     SAMHeaderError
@@ -100,7 +104,11 @@ module XAMErrors
         qname_too_long
         qual_no_seq
         qual_seq_mismatch
-
+        invalid_reference # reference with invalid name or length
+        duplicate_reference # two references with the same name
+        invalid_reference_id # record has a reference ID outside the references
+        unknown_reference # record's reference is not present in the destination
+        reference_length_mismatch # same reference name, but different lengths
     end
 end # module XAMErrors
 
@@ -143,14 +151,8 @@ struct HasEq end
 
 const CTX = Automa.CodeGenContext(; generator = :goto, clean = true)
 
-function to_memory(v)
-    result = Memory{eltype(v)}(undef, length(v))
-    copyto!(result, v)
-    return result
-end
-
 @static if isdefined(Base, :memoryindex)
-    memory_index(x::MemoryRef) = memoryindex(x)
+    memory_index(x::MemoryRef) = Base.memoryindex(x)
 else
     memory_index(x::MemoryRef) = Core.memoryrefoffset(x)
 end
@@ -328,6 +330,7 @@ function seek_first_record end
 include("flags.jl")
 include("stringvec.jl")
 include("header.jl")
+include("references.jl")
 include("bamseq.jl")
 include("sam.jl")
 include("bam.jl")
@@ -369,7 +372,7 @@ name is present in the SAM header.
 
 !!! warning
     For `SAMRecord`, this aliases the record, whereas for `BAMRecord`,
-    the data aliases the owning `BAMReader` or `BAMWriter`.
+    the data aliases the `References` of the record.
     Mutating the underlying record will invalidate the string if returned
     from a `SAMRecord`
 """
@@ -385,7 +388,7 @@ The name is returned as a UTF-8 encoded `AbstractString`.
 
 !!! warning
     For `SAMRecord`, this aliases the record, whereas for `BAMRecord`,
-    the data aliases the owning `BAMReader` or `BAMWriter`.
+    the data aliases the `References` of the record.
     Mutating the underlying record will invalidate the string if returned
     from a `SAMRecord`
 """
@@ -478,17 +481,6 @@ function mapping_span(record::XAMRecord)
         return nothing
     end
     return left:(left + CIGARStrings.ref_length(cig) - 1)
-end
-
-
-# TODO: Does this make sense? We already have ref information elsewhere.
-# maybe delete it.
-# TODO: Add more information?
-# TODO: Add a show method
-# This should be super cheap to construct - make it cheaper!
-struct Reference
-    name::StringView{ImmutableMemoryView{UInt8}}
-    len::Int
 end
 
 """

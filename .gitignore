@@ -7,3 +7,6 @@ LocalPreferences.toml
 *code-workspace
 *.sam
 *.bam
+!test/data/*.sam
+!test/data/*.bam
+test/trim/build

@@ -26,6 +26,7 @@ struct StringVec <: AbstractVector{StringView{ImmutableMemoryView{UInt8}}}
 end
 
 Base.size(x::StringVec) = (length(x.offsets) - 1,)
+Base.IndexStyle(::Type{StringVec}) = IndexLinear()
 
 function Base.getindex(x::StringVec, i::Integer)
     @boundscheck checkbounds(x, i)

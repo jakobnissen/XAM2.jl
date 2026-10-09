@@ -35,7 +35,10 @@ XAMAuxData = "0.1.7"
 julia = "1.11.6"
 
 [extras]
+BGZFLib = "b86bd9b6-aa64-492d-a0e2-e61a004d8aed"
+CIGARStrings = "e5b51f81-6ffd-4e20-bbec-f118e37ea906"
+MemoryViews = "a791c907-b98b-4e44-8f4d-e4c2362c6b2f"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test"]
+test = ["Test", "BGZFLib", "CIGARStrings", "MemoryViews"]
