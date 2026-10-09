@@ -7,8 +7,14 @@ Every record refers to a [`References`](@ref), which is used to look up the
 names and lengths of the references that the record's reference IDs point to.
 Records read from a `BAMReader` share the reader's `References`.
 
-`BAMRecord`s are semi-lazily parsed, and do not e.g. validate their CIGAR
-before access.
+`BAMRecord`s are semi-lazily parsed: When reading a record, its structure is validated,
+e.g. that its reference IDs and positions are in bounds, and that its fields fit in
+the record. The content of variable-length fields, like the CIGAR, is validated
+when accessed. Accessors never throw on malformed data: Malformed content is returned
+as an error value, e.g. [`cigar`](@ref) returns a `CIGARError` for a malformed CIGAR.
+
+Auxiliary data is returned as an `XAMAuxData.BAM.Auxiliary`, which may throw
+when accessed if it is malformed. Use `XAMAuxData.is_well_formed` to check this first.
 
     BAMRecord(refs::References)::BAMRecord
     BAMRecord(io::Union{BAMReader, BAMWriter})::BAMRecord
@@ -17,6 +23,22 @@ Create an unmapped, empty (but valid) record referring to `refs`, or to the
 references of `io`.
 """
 mutable struct BAMRecord
+    # Structural invariants. Every `BAMRecord` satisfies these, so accessors may rely on them,
+    # e.g. using `@inbounds`. Records from `try_read!` are checked by `check_fixed_fields`,
+    # and for the null terminator of the read name. Records created any other way are valid
+    # by construction. The fields of `BAMRecord` are internal, so users can't violate these.
+    # 1. `length(data) <= typemax(UInt32) - 32`, so the block size fits in a `UInt32`
+    #    (see `block_size`)
+    # 2. The variable-length fields fit in `data`, i.e.
+    #    `l_read_name + 4 * n_cigar_op + cld(l_seq, 2) + l_seq <= length(data)`,
+    #    computed without overflow. The rest of `data` is auxiliary data.
+    # 3. `l_read_name >= 1`, and `data[l_read_name] == 0x00`
+    # 4. `refID` and `next_refID` are in `-1:(length(refs) - 1)`
+    # 5. `pos >= -1` and `next_pos >= -1`
+    # The content of the variable-length fields (CIGAR, quality, auxiliary data) is not
+    # validated when reading, but when accessed. Accessors return malformed content
+    # as an error value, and never throw.
+
     # This data contains, in order, with no unused bytes at the end:
     # 1. Read name including trailing null byte
     # 2. Cigar ops encoded in 32 bits each
@@ -29,11 +51,11 @@ mutable struct BAMRecord
 
     # This field is cached. Uninit means: Not computed. Nothing means no cigar.
     # Otherwise, a cigar or invalid data.
-    cigar::Union{Uninit, Nothing, BAMCIGAR, CIGARError}
+    cigar::Union{Uninit, Nothing, BAMCIGAR, CIGARError, XAMErrorKind}
 
-    # fixed-length fields (see BAM specs for the details)
-    # Length of alignment record, excluding this 32-bit field
-    block_size::UInt32
+    # Fixed-length fields (see BAM specs for the details), in the same layout as in BAM,
+    # such that they can be copied with `memcpy`.
+    # The block size field that precedes them in BAM is not stored, see `block_size`.
     # Zero-based index of reference in , -1 if missing
     refID::Int32
     # Zero-based position of leftmost base of alignment, or -1 if missing
@@ -60,7 +82,6 @@ mutable struct BAMRecord
 end
 
 const BAM_RECORD_CONTENT = [
-    0x22, 0x00, 0x00, 0x00, # size of an empty BAM record
     0xff, 0xff, 0xff, 0xff, # unmapped refid
     0xff, 0xff, 0xff, 0xff, # unmapped pos
     0x02, # read name len
@@ -74,7 +95,13 @@ const BAM_RECORD_CONTENT = [
     0x00, 0x00, 0x00, 0x00, # unmapped tlen
 ] |> Tuple
 
+# Number of bytes of fixed-length fields stored in `BAMRecord`. In BAM, they are
+# preceded by the 4-byte block size.
 const BAM_FIXED_BYTES = length(BAM_RECORD_CONTENT)
+
+# The BAM block size: The number of bytes of the record after the block size field.
+# Invariant: This fits in a `UInt32`.
+block_size(record::BAMRecord) = (length(record.data) + BAM_FIXED_BYTES) % UInt32
 
 # Short form: Mapped, read name, strand
 function Base.show(io::IO, record::BAMRecord)
@@ -123,7 +150,7 @@ function Base.show(io::IO, ::MIME"text/plain", record::BAMRecord)
     # Mapping span
     print(buf, "  Ref pos: ")
     span = mapping_span(record)
-    if span !== nothing
+    if span isa UnitRange{Int}
         println(buf, span)
     else
         left = left_position(record)
@@ -148,7 +175,7 @@ function Base.show(io::IO, ::MIME"text/plain", record::BAMRecord)
     cig = cigar(record)
     if cig === nothing
         println(buf, "< missing >")
-    elseif cig isa CIGARError
+    elseif cig isa Union{CIGARError, XAMErrorKind}
         println(buf, "< malformed CIGAR >")
     else
         str = String(MemoryView(CIGAR(cig)))
@@ -227,6 +254,8 @@ references(reader::BAMReader) = reader.refs
 
 const FIXED_BAM_OFFSET = fieldoffset(BAMRecord, 4)
 
+@assert sizeof(BAMRecord) == FIXED_BAM_OFFSET + BAM_FIXED_BYTES
+
 """
     reset!(::BAMRecord)
 
@@ -281,9 +310,10 @@ function Base.copy(record::BAMRecord)
 end
 
 function seek_first_record(reader::BAMReader)
-    # TODO: Check code base for when we reset reader.error
     seek(reader.reader, reader.offset_first_record)
     reset!(reader.record)
+    # Errors are sticky until the reader is seeked, except if it's closed
+    reader.error == XAMErrors.closed_stream || (reader.error = nothing)
     return reader
 end
 
@@ -414,7 +444,8 @@ end
 
 function query_name(record::BAMRecord)::Union{AbstractString, Nothing}
     view = ImmutableMemoryView(record.data)
-    view = view[1:Int(record.l_read_name - 0x01)]
+    # Invariant: l_read_name >= 1, and the read name fits in the data
+    view = @inbounds view[1:(record.l_read_name - 1)]
     return if length(view) == 1 && @inbounds view[1] == UInt8('*')
         nothing
     else
@@ -422,36 +453,41 @@ function query_name(record::BAMRecord)::Union{AbstractString, Nothing}
     end
 end
 
+# Invariant: refID and next_refID are in -1:(length(refs) - 1)
 function reference_name(record::BAMRecord)::Union{Nothing, AbstractString}
     record.refID < 0 && return nothing
-    id = record.refID + 1
-    return record.refs.names[id]
+    return @inbounds record.refs.names[record.refID + 1]
 end
 
 function next_reference_name(record::BAMRecord)::Union{Nothing, AbstractString}
     record.next_refID < 0 && return nothing
-    id = record.next_refID + 1
-    return record.refs.names[id]
+    return @inbounds record.refs.names[record.next_refID + 1]
 end
 
 function reference(record::BAMRecord)::Union{Nothing, Reference}
     record.refID < 0 && return nothing
-    return record.refs[record.refID + 1]
+    return @inbounds record.refs[record.refID + 1]
 end
 
 function reference_length(record::BAMRecord)::Union{Int, Nothing}
     record.refID < 0 && return nothing
-    id = record.refID + 1
-    return record.refs.lengths[id] % Int
+    return @inbounds(record.refs.lengths[record.refID + 1]) % Int
 end
+
+# Invariant: The variable-length fields fit in the data.
+# Offsets are computed as Int, so they can't overflow.
+cigar_offset(record::BAMRecord) = record.l_read_name % Int
+seq_offset(record::BAMRecord) = cigar_offset(record) + 4 * (record.n_cigar_op % Int)
+qual_offset(record::BAMRecord) = seq_offset(record) + cld(record.l_seq % Int, 2)
+aux_offset(record::BAMRecord) = qual_offset(record) + record.l_seq % Int
 
 function first_eq_seq_pos(record::BAMRecord)
     iszero(record.l_seq) && return nothing
-    n_seq_whole_bytes = record.l_seq >> 1
-    offset = record.l_read_name + 4 * record.n_cigar_op
+    n_seq_whole_bytes = (record.l_seq >> 1) % Int
+    offset = seq_offset(record)
     has_half_byte = isodd(record.l_seq)
     span = (offset + 1):(offset + n_seq_whole_bytes + has_half_byte)
-    mem = ImmutableMemoryView(record.data)[span]
+    mem = @inbounds ImmutableMemoryView(record.data)[span]
     if has_half_byte
         (last_byte, mem) = @inbounds split_last(mem)
         iszero(last_byte & 0xf0) && return record.l_seq % Int
@@ -491,17 +527,15 @@ The returned `AbstractString`'s type is an implementation detail, but it is guar
 """
 function sequence(record::BAMRecord)::Union{BAMSeq, Nothing}
     iszero(record.l_seq) && return nothing
-    offset = record.l_read_name + record.n_cigar_op * 4
-    seq_bytes = (record.l_seq + 1) >> 1
-    span = (offset + 1):(offset + seq_bytes)
-    return BAMSeq(ImmutableMemoryView(record.data)[span], record.l_seq % Int)
+    span = (seq_offset(record) + 1):qual_offset(record)
+    return BAMSeq(@inbounds(ImmutableMemoryView(record.data)[span]), record.l_seq % Int)
 end
 
 """
     quality_scores(record::BAMRecord)::Union{Nothing, ImmutableMemoryView{UInt8}}
 
 Return the quality as a PHRED-encoded memory view, or `nothing` if the quality is
-missing (set to all `0xFF`)
+missing (set to all `0xFF`, or the sequence is missing).
 
 Note that the returned quality does not have a PHRED offset, so e.g. a PHRED
 score of 31 is encoded as `UInt8(31)` as opposed to e.g. `UInt8(31 + 33)`.
@@ -511,12 +545,12 @@ score of 31 is encoded as `UInt8(31)` as opposed to e.g. `UInt8(31 + 33)`.
     invalidate the array
 """
 function quality_scores(record::BAMRecord)::Union{Nothing, ImmutableMemoryView{UInt8}}
-    seq_bytes = (record.l_seq + 1) >> 1
-    offset = record.l_read_name + 4 * record.n_cigar_op + seq_bytes
-    qual = ImmutableMemoryView(record.data)[(offset + 1):(offset + record.l_seq)]
+    iszero(record.l_seq) && return nothing
+    span = (qual_offset(record) + 1):aux_offset(record)
+    qual = @inbounds ImmutableMemoryView(record.data)[span]
 
     # Missing quality is encoded as all-0xFF
-    return if !isempty(qual) && @inbounds first(qual) == 0xff
+    return if @inbounds first(qual) == 0xff
         nothing
     else
         qual
@@ -537,10 +571,7 @@ is empty.
 See the documentation of `XAMAuxData.BAM.Auxiliary` for more details.
 """
 function aux_data(record::BAMRecord)
-    seq = record.l_seq
-    n_seq_bytes = (seq + 1) >> 1
-    offset = record.l_read_name + seq + n_seq_bytes + 4 * record.n_cigar_op
-    return XAMAuxData.BAM.Auxiliary(record.data, offset + 1)
+    return XAMAuxData.BAM.Auxiliary(record.data, aux_offset(record) + 1)
 end
 
 const CIGAR_LUT = let
@@ -556,46 +587,54 @@ function left_position(record::BAMRecord)::Union{Int, Nothing}
     return iszero(result) ? nothing : result
 end
 
-function cigar(record::BAMRecord)::Union{Nothing, BAMCIGAR, CIGARError}
+function cigar(record::BAMRecord)::Union{Nothing, BAMCIGAR, CIGARError, XAMErrorKind}
     record.cigar === Uninit() || return record.cigar
     encoding = get_cigar_encoding(record)
     if encoding === nothing
         record.cigar = nothing
         return nothing
     end
-    return record.cigar = CIGARStrings.try_parse(BAMCIGAR, encoding)
+    cig = CIGARStrings.try_parse(BAMCIGAR, encoding)
+    if !isa(cig, CIGARError)
+        cig = check_query_length(cig, record.l_seq % Int)
+    end
+    return record.cigar = cig
 end
 
-@inline function is_missing_encoding(record::BAMRecord, cigar_encoding::ImmutableMemoryView{UInt8})
+# CIGARs with more than 65535 operations are stored in the CG auxiliary tag,
+# with a placeholder CIGAR `kSmN`, where k is the sequence length, and m the
+# reference length.
+@inline function is_placeholder_cigar(record::BAMRecord, cigar_encoding::ImmutableMemoryView{UInt8})
     length(cigar_encoding) == 8 || return false
+    record.refID < 0 && return false
     u1 = unsafe_load_integer_le(UInt32, cigar_encoding, 1)
     u2 = unsafe_load_integer_le(UInt32, cigar_encoding, 5)
     return if ((u1 & 0x0f) != 0x04) | ((u2 & 0x0f) != 0x03)
-        return false
+        false
     else
-        ref_length = record.refs.lengths[record.refID + 1]
+        ref_length = @inbounds record.refs.lengths[record.refID + 1]
         ((u1 >> 4) == record.l_seq) & ((u2 >> 4) == ref_length)
     end
 end
 
 function get_cigar_encoding(x::BAMRecord)::Union{Nothing, ImmutableMemoryView{UInt8}}
     iszero(x.n_cigar_op) && return nothing
-    lastindex = x.l_read_name + 4 * x.n_cigar_op
-    @boundscheck checkbounds(x.data, lastindex)
-    view = ImmutableMemoryView(x.data)
-    vw = view[(x.l_read_name + 1):lastindex]
-    return is_missing_encoding(x, vw) ? load_aux_cigar(x) : vw
+    span = (cigar_offset(x) + 1):seq_offset(x)
+    vw = @inbounds ImmutableMemoryView(x.data)[span]
+    return is_placeholder_cigar(x, vw) ? load_aux_cigar(x, vw) : vw
 end
 
-# Outlined, because it's expected to be rare
-@noinline function load_aux_cigar(x::BAMRecord)::Union{Nothing, ImmutableMemoryView{UInt8}}
-    v = get(aux_data(x), "CG", nothing)
-    isnothing(v) && return v
-    return if isa(v, AbstractVector{UInt32})
-        parent(v)
-    else
-        nothing
-    end
+# Get the CIGAR in the CG tag, or return the placeholder CIGAR if the tag is
+# not present, like htslib. Outlined, because it's expected to be rare.
+@noinline function load_aux_cigar(
+        x::BAMRecord,
+        placeholder::ImmutableMemoryView{UInt8},
+    )::ImmutableMemoryView{UInt8}
+    aux = aux_data(x)
+    # Accessing malformed aux data may throw, so we check first.
+    is_well_formed(aux) || return placeholder
+    v = get(aux, "CG", nothing)
+    return v isa AbstractVector{UInt32} ? parent(v) : placeholder
 end
 
 function unsafe_load_fixed_fields(record::BAMRecord, buffer::ImmutableMemoryView{UInt8})
@@ -611,13 +650,17 @@ function unsafe_load_fixed_fields(record::BAMRecord, buffer::ImmutableMemoryView
 end
 
 """
-    XAM2.try_read(reader::BAMReader)::Union{BAMRecord, Nothing, XAMErrorKind}
+    XAM2.try_read!(reader::BAMReader)::Union{BAMRecord, Nothing, XAMErrorKind}
 
 Attempt to read the next record of `reader`, similar to iterating the reader.
 If the reader is EOF, return `nothing`.
 If the next record is malformed, return a `XAMErrorKind`.
 Once this function returns a `XAMErrorKind`, subsequent calls to this function
 will return the same error until the reader is closed or seeked.
+
+The structure of the record is validated, e.g. that its fields fit in the record,
+and that its reference IDs and positions are in bounds. The content of variable-length
+fields, e.g. the CIGAR, is validated when it is accessed.
 
 This function does not throw if the reader's data is malformed.
 """
@@ -629,48 +672,50 @@ function try_read!(x::BAMReader)::Union{BAMRecord, Nothing, XAMErrorKind}
     isnothing(buffer) && return nothing
 
     record = x.record
-    vector = record.data
-
     record.cigar = Uninit()
 
-    # Make room for the fixed bytes
-    resize!(vector, BAM_FIXED_BYTES)
-    remaining = MemoryView(vector)
+    # Read the block size, and the fixed-length fields into the record
+    memview = fill_bytes_to_data!(x, 4 + BAM_FIXED_BYTES)
+    isnothing(memview) && return fail_read!(x, XAMErrors.truncated_file)
+    stored_block_size = unsafe_load_integer_le(UInt32, memview, 1)
+    unsafe_load_fixed_fields(record, @inbounds memview[5:end])
+    err = check_fixed_fields(record, stored_block_size)
+    err === nothing || return fail_read!(x, err)
 
-    memview = fill_bytes_to_data!(x, BAM_FIXED_BYTES)
-    if isnothing(memview)
-        x.error = XAMErrors.truncated_file
-        return x.error
-    end
-
-    unsafe_load_fixed_fields(record, memview)
-
-    # Read all the variable length.
-    # The block size is the total length, except the first 4 byte field,
-    # account for that.
-    remaining_bytes = record.block_size - BAM_FIXED_BYTES + 4
-
-    # Ensure the total field length is not shorter than the sum of the
-    # variable field names
-    seq_bytes = (record.l_seq + UInt32(1)) >> 1
-    minimum_bytes = record.l_read_name + record.l_seq + seq_bytes + 4 * record.n_cigar_op
-
-    if remaining_bytes < minimum_bytes
-        x.error = XAMErrors.invalid_block_length
-        return x.error
-    end
-
-    # Read all the remaining bytes, overwriting the fixed field bytes,
+    # Read all the variable length fields, overwriting the fixed field bytes,
     # which we have already moved into the integer fields of the struct
-    resize!(vector, remaining_bytes)
-    remaining = MemoryView(vector)
+    data_len = (stored_block_size - UInt32(BAM_FIXED_BYTES)) % Int
+    memview = fill_bytes_to_data!(x, data_len)
+    isnothing(memview) && return fail_read!(x, XAMErrors.truncated_file)
+    resize!(record.data, data_len)
+    @inbounds(record.data[record.l_read_name]) == 0x00 || return fail_read!(x, XAMErrors.invalid_read_name)
+    return record
+end
 
-    memview = fill_bytes_to_data!(x, remaining_bytes)
-    if isnothing(memview)
-        x.error = XAMErrors.truncated_file
-        return x.error
-    end
-    return x.record
+# Set the reader's sticky error, and reset its record, since a failed read
+# may leave the record in a state that violates its invariants.
+@noinline function fail_read!(x::BAMReader, err::XAMErrorKind)::XAMErrorKind
+    reset!(x.record)
+    x.error = err
+    return err
+end
+
+# Check the structural invariants of `record` that only depend on its fixed fields,
+# see the comment in the definition of `BAMRecord`.
+function check_fixed_fields(record::BAMRecord, stored_block_size::UInt32)::Union{Nothing, XAMErrorKind}
+    # The block size includes the fixed fields after the block size field.
+    stored_block_size < BAM_FIXED_BYTES && return XAMErrors.invalid_block_length
+    data_len = (stored_block_size - UInt32(BAM_FIXED_BYTES)) % Int
+    iszero(record.l_read_name) && return XAMErrors.invalid_read_name
+    n_refs = length(record.refs)
+    is_valid_reference_id(record.refID, n_refs) || return XAMErrors.invalid_reference_id
+    is_valid_reference_id(record.next_refID, n_refs) || return XAMErrors.invalid_reference_id
+    (record.pos < -1 || record.next_pos < -1) && return XAMErrors.invalid_position
+    # Computed as Int, so it can't overflow
+    l_seq = record.l_seq % Int
+    min_len = record.l_read_name % Int + 4 * (record.n_cigar_op % Int) + cld(l_seq, 2) + l_seq
+    min_len > data_len && return XAMErrors.invalid_block_length
+    return nothing
 end
 
 """
@@ -854,31 +899,33 @@ end
 function write_record(writer::BAMWriter, record::BAMRecord, ref_id::Int32, next_ref_id::Int32)::Int
     bgzf = writer.writer
     buffer = get_buffer(bgzf)
-    if length(buffer) < BAM_FIXED_BYTES
+    n_header_bytes = 4 + BAM_FIXED_BYTES
+    if length(buffer) < n_header_bytes
         grow_buffer(bgzf)
         buffer = get_buffer(bgzf)
         # This is unreachable, because calling `grow_buffer` on a BGZFWriter
         # will always make sure the next buffer is a full BGZF block,
         # which is 64 KiB.
-        length(buffer) < BAM_FIXED_BYTES && error("unreachable")
+        length(buffer) < n_header_bytes && error("unreachable")
     end
+    inbounds_store_le!(buffer, 1, block_size(record))
     GC.@preserve record buffer begin
         src = Ptr{UInt8}(pointer_from_objref(record)) + FIXED_BAM_OFFSET
         @ccall memcpy(
-            pointer(buffer)::Ptr{Cchar},
+            (pointer(buffer) + 4)::Ptr{Cchar},
             src::Ptr{Cchar},
             (BAM_FIXED_BYTES % UInt)::Csize_t,
         )::Cvoid
     end
-    # Byte offsets of refID and next_refID in the fixed fields
+    # Byte offsets of refID and next_refID, after the block size
     inbounds_store_le!(buffer, 5, ref_id)
     inbounds_store_le!(buffer, 25, next_ref_id)
-    @inbounds consume(bgzf, BAM_FIXED_BYTES)
+    @inbounds consume(bgzf, n_header_bytes)
     # Write variable bytes
-    return BAM_FIXED_BYTES + write(bgzf, record.data)
+    return n_header_bytes + write(bgzf, record.data)
 end
 
-@inline function inbounds_store_le!(mem::MutableMemoryView{UInt8}, i::Int, x::Int32)
+@inline function inbounds_store_le!(mem::MutableMemoryView{UInt8}, i::Int, x::Union{Int32, UInt32})
     u = x % UInt32
     for offset in 0:3
         @inbounds mem[i + offset] = (u >> (8 * offset)) % UInt8
@@ -920,7 +967,7 @@ function Base.copy!(dst::BAMRecord, src::SAMRecord)
     # Mapping span and bin
     dst.bin = let
         ms = mapping_span(src)
-        if ms === nothing
+        if !isa(ms, UnitRange{Int})
             UInt16(4680)
         else
             span = (first(ms) % Int32):(last(ms) % Int32)
@@ -936,8 +983,10 @@ function Base.copy!(dst::BAMRecord, src::SAMRecord)
     cigar_too_big = false
     dst.n_cigar_op = if cig === nothing
         0
-    elseif cig isa XAMErrorKind
+    elseif cig isa CIGARError
         throw_xam_error(XAMErrors.invalid_cigar)
+    elseif cig isa XAMErrorKind
+        throw_xam_error(cig)
     else
         cigar_too_big = length(cig) > typemax(UInt16)
         # If CIGAR is to big, we store this dummy value and store the real cigar in an AUX tag
@@ -1032,8 +1081,11 @@ function Base.copy!(dst::BAMRecord, src::SAMRecord)
         end
     end
 
-    # Finally, the total block size can be computed
-    dst.block_size = (length(dst.data) + BAM_FIXED_BYTES - 4) % UInt32
+    # Maintain the invariant that the block size fits in a UInt32
+    if length(dst.data) > typemax(UInt32) - BAM_FIXED_BYTES
+        reset!(dst)
+        throw_xam_error(XAMErrors.record_too_long)
+    end
 
     return dst
 end
@@ -1115,6 +1167,8 @@ function Base.copy!(dst::SAMRecord, src::BAMRecord)
     cig = cigar(src)
     if cig isa CIGARError
         throw_xam_error(XAMErrors.invalid_cigar)
+    elseif cig isa XAMErrorKind
+        throw_xam_error(cig)
     elseif cig === nothing
         push!(data, UInt8('*'))
     else

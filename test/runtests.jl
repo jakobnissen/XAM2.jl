@@ -1,9 +1,9 @@
 using Test
 using XAM2
 using XAM2: XAMErrors, Reference, try_write, try_parse_header, seek_first_record
-using BGZFLib: BGZFReader
+using BGZFLib: BGZFReader, BGZFWriter
 using MemoryViews: ImmutableMemoryView, MemoryView
-using CIGARStrings: CIGAR
+using CIGARStrings: CIGAR, CIGARError
 
 const DATADIR = joinpath(@__DIR__, "data")
 # Created from example.sam with `samtools view --no-PG -b -o example.bam example.sam`
@@ -223,6 +223,8 @@ end
         end
     end
 end
+
+include("malformed.jl")
 
 @testset "SAMReader" begin
     # SAM record parsing is not yet implemented (see REVIEW.md)

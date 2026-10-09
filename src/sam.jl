@@ -139,7 +139,7 @@ true
 mutable struct SAMRecord
     # Data contains the unmodified input line.
     data::Vector{UInt8}
-    cigar::Union{Uninit, Nothing, CIGAR, CIGARError}
+    cigar::Union{Uninit, Nothing, CIGAR, CIGARError, XAMErrorKind}
 
     # TODO: When parsing, set the values to sentinels
     # if not mapped. This way, we can avoid checking mapping
@@ -313,7 +313,7 @@ function Base.show(io::IO, ::MIME"text/plain", record::SAMRecord)
     # Mapping span
     print(buf, "  Ref pos: ")
     span = mapping_span(record)
-    if span !== nothing
+    if span isa UnitRange{Int}
         println(buf, span)
     else
         left = left_position(record)
@@ -338,7 +338,7 @@ function Base.show(io::IO, ::MIME"text/plain", record::SAMRecord)
     cig = cigar(record)
     if cig === nothing
         println(buf, "< missing >")
-    elseif cig isa CIGARError
+    elseif cig isa Union{CIGARError, XAMErrorKind}
         println(buf, "< malformed CIGAR >")
     else
         str = String(MemoryView(CIGAR(cig)))
@@ -384,12 +384,18 @@ function reference_name(record::SAMRecord)::Union{Nothing, AbstractString}
     end
 end
 
-function cigar(record::SAMRecord)::Union{Nothing, CIGAR, CIGARError}
+function cigar(record::SAMRecord)::Union{Nothing, CIGAR, CIGARError, XAMErrorKind}
     record.cigar === Uninit() || return record.cigar
     view = ImmutableMemoryView(record.data)
     view = view[(record.cigar_offset + 1):(first(record.rnext_span) - 2)]
     length(view) == 1 && @inbounds view[1] == UInt8('*') && return nothing
-    return record.cigar = CIGARStrings.try_parse(CIGAR, view)
+    cig = CIGARStrings.try_parse(CIGAR, view)
+    if !isa(cig, CIGARError)
+        seq = sequence(record)
+        seq_len = seq === nothing ? 0 : ncodeunits(seq)
+        cig = check_query_length(cig, seq_len)
+    end
+    return record.cigar = cig
 end
 
 function next_reference_name(record::SAMRecord)::Union{Nothing, AbstractString}

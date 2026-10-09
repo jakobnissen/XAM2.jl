@@ -14,6 +14,7 @@ using XAM2:
     query_name,
     reference_name,
     next_reference_name,
+    mapping_span,
     try_write
 
 function summarize(reader::BAMReader)
@@ -27,6 +28,8 @@ function summarize(reader::BAMReader)
         push!(names, name === nothing ? "*" : String(name))
         push!(names, rname === nothing ? "*" : String(rname))
         push!(names, rnext === nothing ? "*" : String(rnext))
+        span = mapping_span(record)
+        push!(names, span isa UnitRange{Int} ? string(span) : "*")
     end
     return (n_records, names)
 end

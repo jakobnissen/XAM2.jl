@@ -52,7 +52,7 @@ function XAM2.sequence(
     span === nothing && return nothing
     cig = cigar(record)
     cig === nothing && return nothing # no CIGAR
-    cig isa CIGARStrings.CIGARError && error("Record has invalid CIGAR")
+    cig isa Union{CIGARStrings.CIGARError, XAM2.XAMErrorKind} && error("Record has invalid CIGAR")
     refview = view(ref, span)
     gap_positions = (i for i in eq_pos:length(seq) if isgap(seq[i]))
     for (gap_position, translation) in pos_to_pos(query, ref, cig, gap_positions)

@@ -25,7 +25,7 @@ using MemoryViews:
 using StringViews: StringView
 using BGZFLib: BGZFReader, BGZFWriter, virtual_position, VirtualOffset
 using CIGARStrings: CIGARStrings, AbstractCIGAR, BAMCIGAR, CIGAR, CIGARError, unsafe_switch_memory
-using XAMAuxData: XAMAuxData, AuxTag, try_auxtag
+using XAMAuxData: XAMAuxData, AuxTag, try_auxtag, is_well_formed
 
 using Automa: Automa, @re_str, onenter!, onexit!, onall!, rep, rep1, opt
 
@@ -109,6 +109,10 @@ module XAMErrors
         invalid_reference_id # record has a reference ID outside the references
         unknown_reference # record's reference is not present in the destination
         reference_length_mismatch # same reference name, but different lengths
+        invalid_read_name # read name length is zero, or not null terminated
+        invalid_position # position is less than -1
+        cigar_query_length_mismatch # CIGAR's query length differs from sequence length
+        record_too_long # BAM record's block size does not fit in 32 bits
     end
 end # module XAMErrors
 
@@ -296,7 +300,7 @@ end
 # * If old_cigar is a AbstractCIGAR, it aliases `old_vector`
 # * old_vector == new_vector
 function copy_cigar!(
-        old_cigar::Union{Nothing, Uninit, CIGARError, AbstractCIGAR},
+        old_cigar::Union{Nothing, Uninit, CIGARError, XAMErrorKind, AbstractCIGAR},
         old_vector::Vector{UInt8},
         new_vector::Vector{UInt8},
     )
@@ -318,6 +322,16 @@ function copy_cigar!(
     dst_mem = ImmutableMemoryView(dst_mem)
     new_cigar = unsafe_switch_memory(old_cigar, dst_mem)
     return new_cigar
+end
+
+# Return `cig`, or an error if its query length differs from the sequence length.
+# A sequence length of zero means the sequence is missing, so any CIGAR is allowed.
+function check_query_length(cig::T, seq_len::Int)::Union{T, XAMErrorKind} where {T <: AbstractCIGAR}
+    # The query length is stored in the CIGAR, so this is cheap
+    if !iszero(seq_len) && CIGARStrings.query_length(cig) != seq_len
+        return XAMErrors.cigar_query_length_mismatch
+    end
+    return cig
 end
 
 """
@@ -411,12 +425,14 @@ of `record`, or `nothing` if the data is not available.
 function left_position end
 
 """
-    cigar(record::SAMRecord)::Union{Nothing, CIGAR, CIGARError}
-    cigar(record::BAMRecord)::Union{Nothing, BAMCIGAR, CIGARError}
+    cigar(record::SAMRecord)::Union{Nothing, CIGAR, CIGARError, XAMErrorKind}
+    cigar(record::BAMRecord)::Union{Nothing, BAMCIGAR, CIGARError, XAMErrorKind}
 
 Get the `cigar` of `record` as a `CIGARStrings.CIGAR` or
 `CIGARStrings.BAMCIGAR`, or return `nothing` if the data is not available,
 or a `CIGARStrings.CIGARError` if the cigar is malformed.
+If the record has a sequence, and the query length of the cigar differs from
+the length of the sequence, return `XAMErrors.cigar_query_length_mismatch`.
 
 This operation will validate the underlying data, and then cache
 the constructed cigar such that subsequent calls to this function
@@ -464,22 +480,20 @@ Get the header of the reader.
 function get_header end
 
 """
-    mapping_span(record::XAMRecord)::Union{Nothing, UnitRange{Int}}
+    mapping_span(record::XAMRecord)::Union{Nothing, UnitRange{Int}, CIGARError, XAMErrorKind}
 
 Return the 1-based positions in the reference that `record` is mapped to,
-or `nothing` if this data is not available.
+or `nothing` if the position or CIGAR is not available, or the error
+returned by [`cigar`](@ref) if the CIGAR is invalid.
 
 E.g. a record with CIGAR `10M100S` mapping to reference position 5
 would map to `5:14`.
-
-This data requires the record to contain a valid `POS` and `CIGAR` fields.
 """
-function mapping_span(record::XAMRecord)
+function mapping_span(record::XAMRecord)::Union{Nothing, UnitRange{Int}, CIGARError, XAMErrorKind}
     left = @something left_position(record) return nothing
     cig = cigar(record)
-    if cig === nothing || cig isa CIGARError
-        return nothing
-    end
+    cig === nothing && return nothing
+    cig isa Union{CIGARError, XAMErrorKind} && return cig
     return left:(left + CIGARStrings.ref_length(cig) - 1)
 end
 
