@@ -23,7 +23,7 @@ using MemoryViews:
     split_at
 
 using StringViews: StringView
-using BGZFLib: BGZFReader, BGZFWriter, virtual_position, virtual_seek, VirtualOffset
+using BGZFLib: BGZFReader, BGZFWriter, virtual_position, VirtualOffset
 using CIGARStrings: CIGARStrings, AbstractCIGAR, BAMCIGAR, CIGAR, CIGARError, unsafe_switch_memory
 using XAMAuxData: XAMAuxData, AuxTag, try_auxtag
 
@@ -66,10 +66,10 @@ public try_parse!,
     SAMHeaderError
 
 """
-        module XAMErrors
+    module XAMErrors
 
-    This module is used as a namespace for the [`XAMErrorKind`](@ref) enum.
-    """
+This module is used as a namespace for the [`XAMErrorKind`](@ref) enum.
+"""
 module XAMErrors
 
     """

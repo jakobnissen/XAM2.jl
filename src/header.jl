@@ -181,15 +181,15 @@ Namespace module for `SortOrder`
 """
 module SortOrders
 
-"""
-    SortOrder
+    """
+        SortOrder
 
-1-byte enum with the available sort orders in the SAM/BAM format.
-Currently, as per the SAM specs, the following are defined:
-`unknown`, `unsorted`, `queryname`, `corrdinate` 
-"""
-@enum SortOrder::UInt8 unknown unsorted queryname coordinate
-export SortOrder, unknown, unsorted, queryname, coordinate
+    1-byte enum with the available sort orders in the SAM/BAM format.
+    Currently, as per the SAM specs, the following are defined:
+    `unknown`, `unsorted`, `queryname`, `corrdinate` 
+    """
+    @enum SortOrder::UInt8 unknown unsorted queryname coordinate
+    export SortOrder, unknown, unsorted, queryname, coordinate
 end
 
 using .SortOrders: SortOrders, SortOrder
@@ -218,16 +218,16 @@ Namespace module for `Topology`
 """
 module Topologies
 
-"""
-    Topology
+    """
+        Topology
 
-1-byte enum with the available topologies in the SAM/BAM format.
-Currently, as per the SAM specs, the following are defined:
-`linear`, `circular`.
-If not specified, `linear` is assumed. 
-"""
-@enum Topology::UInt8 linear circular
-export Topology, linear, circular
+    1-byte enum with the available topologies in the SAM/BAM format.
+    Currently, as per the SAM specs, the following are defined:
+    `linear`, `circular`.
+    If not specified, `linear` is assumed. 
+    """
+    @enum Topology::UInt8 linear circular
+    export Topology, linear, circular
 end
 
 using .Topologies: Topologies, Topology

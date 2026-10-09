@@ -562,6 +562,9 @@ function seek_first_record(reader::SAMReader)
     return reader
 end
 
+Base.IteratorSize(::Type{<:SAMReader}) = Base.SizeUnknown()
+Base.eltype(::Type{<:SAMReader}) = SAMRecord
+
 function Base.iterate(reader::SAMReader, _::Nothing = nothing)
     result = try_read!(reader)
     result === nothing && return nothing

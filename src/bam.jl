@@ -263,6 +263,9 @@ function reset!(record::BAMRecord)
     return reset_fixed_fields!(record)
 end
 
+Base.IteratorSize(::Type{<:BAMReader}) = Base.SizeUnknown()
+Base.eltype(::Type{BAMReader{T}}) where {T} = BAMRecord{BAMReader{T}}
+
 function Base.iterate(reader::BAMReader, _::Nothing = nothing)
     result = try_read!(reader)
     result === nothing && return nothing
@@ -301,7 +304,7 @@ end
 
 function seek_first_record(reader::BAMReader)
     # TODO: Check code base for when we reset reader.error
-    virtual_seek(reader.reader, reader.offset_first_record)
+    seek(reader.reader, reader.offset_first_record)
     reset!(reader.record)
     return reader
 end
