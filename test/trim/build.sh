@@ -16,4 +16,4 @@ julia --project="$JULIAC_ENV" -e 'using JuliaC; JuliaC._main_cli(ARGS)' -- \
     --output-exe xam2trim --project=. --trim=safe --bundle build app.jl
 
 OUT="$(mktemp -d)/out.bam"
-./build/bin/xam2trim ../data/example.bam "$OUT"
+./build/bin/xam2trim ../data/example.bam "$OUT" ../data/example.sam

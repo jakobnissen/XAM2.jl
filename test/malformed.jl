@@ -36,11 +36,11 @@ function raw_record(;
 end
 
 # Write a BAM file with the given raw records, and return its path
-function malformed_bam(dir::String, records::Vector{UInt8}...)
+function malformed_bam(dir::String, records::Vector{UInt8}...; text::String = "", refs = MALFORMED_REFS)
     path = tempname(dir)
     BGZFWriter(open(path, "w")) do io
-        write(io, b"BAM\1", le_bytes(UInt32(0)), le_bytes(UInt32(length(MALFORMED_REFS))))
-        for (name, len) in MALFORMED_REFS
+        write(io, b"BAM\1", le_bytes(UInt32(ncodeunits(text))), text, le_bytes(UInt32(length(refs))))
+        for (name, len) in refs
             write(io, le_bytes(UInt32(ncodeunits(name) + 1)), name, 0x00, le_bytes(UInt32(len)))
         end
         for record in records
@@ -66,6 +66,48 @@ function is_reset(record::BAMRecord)
         XAM2.cigar(record) === nothing &&
         sequence(record) === nothing &&
         isempty(aux_data(record))
+end
+
+@testset "BAM header" begin
+    mktempdir() do dir
+        open_bam(; kwargs...) = BAMReader(open(malformed_bam(dir; kwargs...)); n_workers = 1)
+        sq_lines = "@SQ\tSN:chr1\tLN:1000\n@SQ\tSN:chr2\tLN:500\n"
+
+        # Text header agreeing with the binary references
+        reader = open_bam(; text = "@HD\tVN:1.6\n" * sq_lines)
+        @test [sq.sn for sq in get_header(reader).seqs] == ["chr1", "chr2"]
+        close(reader)
+
+        # The text may be padded with null bytes, which are not part of the header
+        reader = open_bam(; text = sq_lines * "\0\0\0")
+        @test length(get_header(reader).seqs) == 2
+        @test String(MemoryView(get_header(reader))) == sq_lines
+        close(reader)
+
+        # The text need not contain @SQ lines
+        reader = open_bam(; text = "@HD\tVN:1.6\n")
+        @test isempty(get_header(reader).seqs)
+        @test references(reader) == References(["chr1", "chr2"], [1000, 500])
+        close(reader)
+
+        # @SQ lines must agree with the binary references
+        for text in [
+                "@SQ\tSN:chr1\tLN:1000\n",
+                "@SQ\tSN:chr2\tLN:500\n@SQ\tSN:chr1\tLN:1000\n",
+                "@SQ\tSN:chr1\tLN:1000\n@SQ\tSN:chr2\tLN:501\n",
+                sq_lines * "@SQ\tSN:chr3\tLN:1\n",
+            ]
+            err = try
+                open_bam(; text)
+            catch e
+                e
+            end
+            @test err == XAMError(XAMErrors.header_reference_mismatch)
+        end
+
+        # Invalid text header
+        @test_throws SAMHeaderError open_bam(; text = "@HD\tVN:1.6\n@XX\tA:1\n")
+    end
 end
 
 @testset "Malformed records" begin
@@ -101,7 +143,7 @@ end
                     (; next_refID = typemin(Int32)) => XAMErrors.invalid_reference_id,
                     # Positions
                     (; pos = Int32(-2)) => XAMErrors.invalid_position,
-                    (; next_pos = typemin(Int32)) => XAMErrors.invalid_position,
+                    (; next_pos = typemin(Int32)) => XAMErrors.invalid_next_position,
                 ]
                 @test read_first(dir, raw_record(; kwargs...)) == err
             end

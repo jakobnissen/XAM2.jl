@@ -4,6 +4,7 @@ using XAM2: XAMErrors, Reference, try_write, try_parse_header, seek_first_record
 using BGZFLib: BGZFReader, BGZFWriter
 using MemoryViews: ImmutableMemoryView, MemoryView
 using CIGARStrings: CIGAR, CIGARError
+using XAM2: AuxTag, SAMHeaderError
 
 const DATADIR = joinpath(@__DIR__, "data")
 # Created from example.sam with `samtools view --no-PG -b -o example.bam example.sam`
@@ -70,7 +71,8 @@ summarize(r::BAMRecord) = (
     header = parse_header("@HD\tVN:1.6\n@SQ\tSN:x\tLN:10\n@SQ\tSN:y\tLN:20\n")
     @test References(header) == References(["x", "y"], [10, 20])
     @test isempty(References(parse_header("@HD\tVN:1.6\n")))
-    @test_throws ArgumentError References(parse_header("@SQ\tSN:x\tLN:10\n@SQ\tSN:x\tLN:20\n"))
+    # Duplicate names are rejected by the header parser
+    @test try_parse_header(ImmutableMemoryView("@SQ\tSN:x\tLN:10\n@SQ\tSN:x\tLN:20\n")) isa SAMHeaderError
 end
 
 @testset "BAMReader" begin
@@ -225,8 +227,5 @@ end
 end
 
 include("malformed.jl")
-
-@testset "SAMReader" begin
-    # SAM record parsing is not yet implemented (see REVIEW.md)
-    @test_broken length(SAMReader(collect, open(EXAMPLE_SAM))) == 6
-end
+include("header.jl")
+include("sam.jl")

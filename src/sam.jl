@@ -1,27 +1,26 @@
 const SAM_MACHINE = let
-    rname_start = re"[0-9A-Za-z!#$%&+./:;?@^_|~-]"
-    rname_end = rname_start | re"\*" | re"="
-    rname = rname_start * rep(rname_end)
-
+    # See the SAM specification, section 1.4
     tab = re"\t"
-    unsigned = onall!(re"[0-9]+", :all_number)
+    digits = onall!(re"[0-9]+", :digit)
+    reference_name = re"\*|[0-9A-Za-z!#$%&+./:;?@^_|~-][0-9A-Za-z!#$%&*+./:;=?@^_|~-]*"
 
     qname = onexit!(re"[!-?A-~]+", :qname)
-    flag = onexit!(copy(unsigned), :flag)
-    r_name = onenter!(onexit!(re"\*" | rname, :rname), :mark)
-    pos = onexit!(copy(unsigned), :pos)
-    mapq = onexit!(copy(unsigned), :mapq)
-    rnext = onenter!(onexit!(r_name | re"=", :rnext), :mark)
-    pnext = onexit!(copy(unsigned), :pnext)
-    tlen = onexit!(onenter!(opt("-"), :enter_sign) * copy(unsigned), :tlen)
-    cigar = onenter!(re"\*" | re"([0-9]+[MIDNSHP=X])+", :cigar)
-    seq = onenter!(re"\*" | re"[A-Za-z=.]+", :seq)
+    flag = onexit!(copy(digits), :flag)
+    rname = onenter!(onexit!(copy(reference_name), :rname), :mark)
+    pos = onexit!(copy(digits), :pos)
+    mapq = onexit!(copy(digits), :mapq)
+    cigar = onenter!(re"\*|([0-9]+[MIDNSHP=X])+", :cigar)
+    rnext = onenter!(onexit!(copy(reference_name) | re"=", :rnext), :mark)
+    pnext = onexit!(copy(digits), :pnext)
+    tlen = onexit!(opt(onenter!(re"-", :negative) | re"\+") * copy(digits), :tlen)
+    seq = onenter!(re"\*|[A-Za-z=.]+", :seq)
     qual = onenter!(re"[!-~]+", :qual)
+    # Auxiliary data is validated lazily
     aux = onenter!(re"[ \t!-~]+", :aux)
 
     line = qname * tab *
         flag * tab *
-        r_name * tab *
+        rname * tab *
         pos * tab *
         mapq * tab *
         cigar * tab *
@@ -32,78 +31,60 @@ const SAM_MACHINE = let
         qual *
         opt(tab * aux)
 
-    onexit!(line, :finish)
-
     Automa.compile(line)
 end
 
+# Numeric fields are accumulated in `n`, and checked when the field is exited.
+# Out-of-range numbers return the error of the field.
 const SAM_ACTIONS = Dict{Symbol, Expr}(
-    :enter_sign => quote
-        is_negative = byte == UInt8('-')
-    end,
-    :all_number => quote
+    :digit => quote
         (n, overflow) = Base.Checked.mul_with_overflow(n, UInt64(0x0a))
         has_overflowed |= overflow
         (n, overflow) = Base.Checked.add_with_overflow(n, (byte - 0x30) % UInt64)
         has_overflowed |= overflow
     end,
-    :mark => quote
-        mark = p % UInt32
-    end,
+    :mark => :(mark = p),
     :qname => quote
         # QNAME's length can be 1:254
-        p > 255 && return XAMErrors.qname_too_long
+        p > 255 && return XAMErrors.invalid_read_name
         record.qname_len = (p - 1) % UInt8
     end,
     :flag => quote
-        n > typemax(UInt16) && return XAMErrors.overflow
+        (has_overflowed | (n > typemax(UInt16))) && return XAMErrors.invalid_flags
         record.flags = new_sam_flags(n % UInt16)
         n = zero(UInt64)
     end,
-    :rname => quote
-        record.rname_span = (mark, (p - 1) % UInt32)
-    end,
+    :rname => :(record.rname_span = (mark % UInt32, (p - 1) % UInt32)),
     :pos => quote
-        n > (typemax(Int32) % UInt64) && return XAMErrors.overflow
+        (has_overflowed | (n > (typemax(Int32) % UInt64))) && return XAMErrors.invalid_position
         record.pos = n % UInt32
         n = zero(UInt64)
     end,
     :mapq => quote
-        n > typemax(UInt8) && return XAMErrors.overflow
+        (has_overflowed | (n > typemax(UInt8))) && return XAMErrors.invalid_mapq
         record.mapq = n % UInt8
         n = zero(UInt64)
     end,
-    :cigar => quote
-        record.cigar_offset = (p - 1) % UInt32
-    end,
-    :rnext => quote
-        record.rnext_span = (mark, (p - 1) % UInt32)
-    end,
+    :cigar => :(record.cigar_offset = (p - 1) % UInt32),
+    :rnext => :(record.rnext_span = (mark % UInt32, (p - 1) % UInt32)),
     :pnext => quote
-        n > (typemax(Int32) % UInt64) && return XAMErrors.overflow
+        (has_overflowed | (n > (typemax(Int32) % UInt64))) &&
+            return XAMErrors.invalid_next_position
         record.pnext = n % UInt32
         n = zero(UInt64)
     end,
+    :negative => :(is_negative = true),
     :tlen => quote
-        maxval = (typemax(Int32) + is_negative) % UInt64
-        n > maxval && return XAMErrors.overflow
-        n = n % Int32
-        record.tlen = (is_negative ? -n : n)
-        n = zero(UInt64)
-        is_negative = false
+        maxval = (typemax(Int32) % UInt64) + is_negative
+        (has_overflowed | (n > maxval)) && return XAMErrors.invalid_template_length
+        n32 = n % Int32
+        record.tlen = is_negative ? -n32 : n32
     end,
-    :seq => quote
-        record.seq_offset = (p - 1) % UInt32
-    end,
-    :qual => quote
-        record.qual_offset = (p - 1) % UInt32
-    end,
+    :seq => :(record.seq_offset = (p - 1) % UInt32),
+    :qual => :(record.qual_offset = (p - 1) % UInt32),
     :aux => quote
         seen_aux = true
         record.aux_offset = (p - 1) % UInt32
-    end,
-    :finish => quote
-        has_overflowed && return XAMErrors.overflow
     end,
 )
 
@@ -137,21 +118,37 @@ true
 ```
 """
 mutable struct SAMRecord
+    # Structural invariants. Every `SAMRecord` satisfies these, so accessors may rely on them,
+    # e.g. using `@inbounds`. Records from `try_parse!` are checked by `SAM_MACHINE`, and
+    # records created any other way are valid by construction.
+    # The fields of `SAMRecord` are internal, so users can't violate these.
+    # 1. `length(data) < typemax(UInt32)`
+    # 2. `data` is a SAM line without the trailing newline, with 11 or more tab-separated
+    #    fields, and the offsets below point to the correct fields, as described in
+    #    their comments.
+    # 3. If SEQ is `*`, QUAL is `*`, and otherwise, QUAL is `*` or has the same length as SEQ.
+    # Records from `try_parse!` additionally have syntactically valid fields, except the
+    # auxiliary data, which is validated when accessed, and the numeric fields are stored
+    # in this struct. Records from `copy!(::SAMRecord, ::BAMRecord)` may have invalid
+    # content copied from the BAM record, e.g. out-of-range qualities.
+    # The CIGAR's content (e.g. that it matches the sequence length) is validated
+    # when accessed.
+
     # Data contains the unmodified input line.
     data::Vector{UInt8}
     cigar::Union{Uninit, Nothing, CIGAR, CIGARError, XAMErrorKind}
 
-    # TODO: When parsing, set the values to sentinels
-    # if not mapped. This way, we can avoid checking mapping
-    # on every access operation
+    # Inclusive start and stop indices of RNAME and RNEXT in `data`
     rname_span::Tuple{UInt32, UInt32}
     rnext_span::Tuple{UInt32, UInt32}
-    cigar_offset::UInt32 # cigar: cigar_offset+1:first(rnext_span)-1
+    cigar_offset::UInt32 # cigar: cigar_offset+1:first(rnext_span)-2
     seq_offset::UInt32 # seq: seq_offset+1:qual_offset-1
     qual_offset::UInt32 # qual: qual_offset+1:aux_offset-1
-    aux_offset::UInt32 # aux: aux_offset+1:end
-    pos::UInt32
-    pnext::UInt32
+    # Index of the tab before the auxiliary data, or `length(data) + 1` if there
+    # is no auxiliary data. Aux: aux_offset+1:end
+    aux_offset::UInt32
+    pos::UInt32 # 1-based, 0 if missing
+    pnext::UInt32 # 1-based, 0 if missing
     tlen::Int32
     flags::SAMFlags
     mapq::UInt8
@@ -168,27 +165,109 @@ end
         data::ImmutableMemoryView{UInt8}
     )::Union{SAMRecord, XAMErrorKind}
 
-Parse the line `data` as a SAM record into `record`, returning it.
-If the data is invalid, `record` is will be in an invalid state,
-and return a `XAMErrorKind`.
-"""
-function try_parse(::SAMRecord, ::ImmutableMemoryView{UInt8}) end
+Parse the line `data` (without a trailing newline) as a SAM record into `record`,
+returning it. The structure of the record is validated, e.g. that it has 11 fields,
+and that the fixed-length fields are valid. The CIGAR and auxiliary data are
+validated when accessed.
 
-@eval function try_parse!(record::SAMRecord, data::ImmutableMemoryView{UInt8})
-    length(data) > typemax(UInt32) && return XAMErrors.line_too_long
-    empty!(record.data)
-    append!(record.data, data)
+If the data is invalid, `record` is reset to an empty record, and an
+`XAMErrorKind` is returned that identifies which field is invalid.
+
+This function does not throw if `data` is malformed.
+"""
+function try_parse!(record::SAMRecord, data::ImmutableMemoryView{UInt8})::Union{SAMRecord, XAMErrorKind}
+    err = if length(data) ≥ typemax(UInt32)
+        XAMErrors.line_too_long
+    else
+        copyto!(resize!(record.data, length(data)), data)
+        record.cigar = Uninit()
+        parse_sam_fields!(record, data)
+    end
+    if err === nothing
+        err = check_seq_qual(record)
+    end
+    if err !== nothing
+        # The record's fields may be partially overwritten, breaking its invariants
+        reset!(record)
+        return err
+    end
+    return record
+end
+
+@eval function parse_sam_fields!(record::SAMRecord, data::ImmutableMemoryView{UInt8})::Union{Nothing, XAMErrorKind}
     n = UInt64(0)
     is_negative = false
     has_overflowed = false
     seen_aux = false
     mark = 0
-    $(Automa.generate_code(CTX, SAM_MACHINE, SAM_ACTIONS))
-    has_overflowed && return XAMErrors.overflow
+    $(Automa.generate_init_code(CTX, SAM_MACHINE))
+    $(Automa.generate_exec_code(CTX, SAM_MACHINE, SAM_ACTIONS))
+    # cs is 0 on success, negative on an invalid byte at `p`, and positive if
+    # the input ended before the line was complete.
+    iszero(cs) || return sam_syntax_error(data, p, cs)
     if !seen_aux
-        record.aux_offset = length(data) % UInt32
+        record.aux_offset = (length(data) + 1) % UInt32
     end
-    return record
+    return nothing
+end
+
+# The error of each of the 11 mandatory fields, in order
+const SAM_FIELD_ERRORS = (
+    XAMErrors.invalid_read_name,
+    XAMErrors.invalid_flags,
+    XAMErrors.invalid_reference_name,
+    XAMErrors.invalid_position,
+    XAMErrors.invalid_mapq,
+    XAMErrors.invalid_cigar,
+    XAMErrors.invalid_next_reference_name,
+    XAMErrors.invalid_next_position,
+    XAMErrors.invalid_template_length,
+    XAMErrors.invalid_sequence,
+    XAMErrors.invalid_quality,
+)
+
+# Slow path, only run when the machine fails: Find the field where the error is.
+@noinline function sam_syntax_error(data::ImmutableMemoryView{UInt8}, p::Int, cs::Int)::XAMErrorKind
+    # On error, p is the index of the invalid byte, and if the input ended early,
+    # p is length(data) + 1.
+    field = count(==(UInt8('\t')), @inbounds(data[1:(p - 1)])) + 1
+    # Input ended before the 11th field
+    (cs > 0 && field < 11) && return XAMErrors.missing_fields
+    return field > 11 ? XAMErrors.invalid_aux_data : @inbounds(SAM_FIELD_ERRORS[field])
+end
+
+# Check that QUAL is missing if SEQ is, and else has the same length.
+function check_seq_qual(record::SAMRecord)::Union{Nothing, XAMErrorKind}
+    seq = seq_view(record)
+    qual = qual_view(record)
+    is_missing(qual) && return nothing
+    is_missing(seq) && return XAMErrors.qual_no_seq
+    length(seq) == length(qual) || return XAMErrors.qual_seq_mismatch
+    return nothing
+end
+
+# Check if a field is `*`, meaning missing
+is_missing(mem::ImmutableMemoryView{UInt8}) = length(mem) == 1 && @inbounds(mem[1]) == UInt8('*')
+
+# Invariant: The offsets point to the correct fields, see the definition of `SAMRecord`.
+# Computed as `Int` to avoid overflow.
+function seq_view(record::SAMRecord)
+    span = ((record.seq_offset % Int) + 1):((record.qual_offset % Int) - 1)
+    return @inbounds ImmutableMemoryView(record.data)[span]
+end
+
+function qual_view(record::SAMRecord)
+    span = ((record.qual_offset % Int) + 1):((record.aux_offset % Int) - 1)
+    return @inbounds ImmutableMemoryView(record.data)[span]
+end
+
+function cigar_view(record::SAMRecord)
+    span = ((record.cigar_offset % Int) + 1):((first(record.rnext_span) % Int) - 2)
+    return @inbounds ImmutableMemoryView(record.data)[span]
+end
+
+function span_view(record::SAMRecord, span::Tuple{UInt32, UInt32})
+    return @inbounds ImmutableMemoryView(record.data)[(first(span) % Int):(last(span) % Int)]
 end
 
 """
@@ -212,13 +291,13 @@ const SAM_RECORD_CONTENT = [
     0x0c, 0x00, 0x00, 0x00, # cigar offset: 12
     0x14, 0x00, 0x00, 0x00, # seq offset: 20
     0x16, 0x00, 0x00, 0x00, # qual offset: 22
-    0x17, 0x00, 0x00, 0x00, # aux offset: 23 (when missing)
+    0x18, 0x00, 0x00, 0x00, # aux offset: 24 (when missing, length of data + 1)
     0x00, 0x00, 0x00, 0x00, # pos
     0x00, 0x00, 0x00, 0x00, # pnext
     0x00, 0x00, 0x00, 0x00, # tlen
     0x04, 0x00, # flags: unmapped
     0xff, # mapq: unavailable,
-    0x00, # qname_len
+    0x01, # qname_len
 ] |> Tuple
 
 
@@ -246,7 +325,7 @@ After this function, the record is equal to a `SAMRecord()`.
 function reset!(record::SAMRecord)
     data = record.data
     resize!(data, length(DEFAULT_SAM_DATA_CONTENT))
-    for i in eachindex(data, DEFAULT_SAM_DATA_CONTENT)
+    for i in 1:length(DEFAULT_SAM_DATA_CONTENT)
         @inbounds data[i] = @inbounds(DEFAULT_SAM_DATA_CONTENT[i])
     end
     record.cigar = Uninit()
@@ -364,31 +443,23 @@ end
 
 
 function query_name(record::SAMRecord)::Union{AbstractString, Nothing}
-    view = ImmutableMemoryView(record.data)
-    view = view[1:record.qname_len]
-    return if length(view) == 1 && @inbounds view[1] == UInt8('*')
-        nothing
-    else
-        StringView(view)
-    end
+    # Invariant: QNAME is the first field, and has length `qname_len`
+    view = @inbounds ImmutableMemoryView(record.data)[1:record.qname_len]
+    return is_missing(view) ? nothing : StringView(view)
 end
 
 function reference_name(record::SAMRecord)::Union{Nothing, AbstractString}
-    view = ImmutableMemoryView(record.data)
-    span = record.rname_span
-    view = view[first(span):last(span)]
-    return if length(view) == 1 && @inbounds view[1] == UInt8('*')
-        nothing
-    else
-        StringView(view)
-    end
+    view = span_view(record, record.rname_span)
+    return is_missing(view) ? nothing : StringView(view)
 end
 
 function cigar(record::SAMRecord)::Union{Nothing, CIGAR, CIGARError, XAMErrorKind}
     record.cigar === Uninit() || return record.cigar
-    view = ImmutableMemoryView(record.data)
-    view = view[(record.cigar_offset + 1):(first(record.rnext_span) - 2)]
-    length(view) == 1 && @inbounds view[1] == UInt8('*') && return nothing
+    view = cigar_view(record)
+    if is_missing(view)
+        record.cigar = nothing
+        return nothing
+    end
     cig = CIGARStrings.try_parse(CIGAR, view)
     if !isa(cig, CIGARError)
         seq = sequence(record)
@@ -399,13 +470,11 @@ function cigar(record::SAMRecord)::Union{Nothing, CIGAR, CIGARError, XAMErrorKin
 end
 
 function next_reference_name(record::SAMRecord)::Union{Nothing, AbstractString}
-    view = ImmutableMemoryView(record.data)
-    span = record.rnext_span
-    view = view[first(span):last(span)]
-    return if length(view) == 1 && @inbounds view[1] == UInt8('*')
+    view = span_view(record, record.rnext_span)
+    return if is_missing(view)
         nothing
     elseif length(view) == 1 && @inbounds view[1] == UInt8('=')
-        return reference_name(record)
+        reference_name(record)
     else
         StringView(view)
     end
@@ -424,13 +493,8 @@ The sequence is a UTF-8 encoded view into the record.
     Mutating the record will invalidate the sequence.
 """
 function sequence(record::SAMRecord)::Union{AbstractString, Nothing}
-    view = ImmutableMemoryView(record.data)
-    view = view[(record.seq_offset + 1):(record.qual_offset - 1)]
-    return if length(view) == 1 && @inbounds view[1] == UInt8('*')
-        nothing
-    else
-        StringView(view)
-    end
+    view = seq_view(record)
+    return is_missing(view) ? nothing : StringView(view)
 end
 
 """
@@ -444,13 +508,8 @@ or `nothing` if the quality is not available.
     Mutating the record will invalidate the quality string.
 """
 function quality_string(record::SAMRecord)::Union{Nothing, AbstractString}
-    view = ImmutableMemoryView(record.data)
-    view = view[(record.qual_offset + 1):(record.aux_offset - 1)]
-    return if length(view) == 1 && @inbounds view[1] == UInt8('*')
-        nothing
-    else
-        StringView(view)
-    end
+    view = qual_view(record)
+    return is_missing(view) ? nothing : StringView(view)
 end
 
 """
@@ -467,17 +526,19 @@ is empty.
 See the documentation of `XAMAuxData.SAM.Auxiliary` for more details.
 """
 function aux_data(record::SAMRecord)
-    return XAMAuxData.SAM.Auxiliary(record.data, record.aux_offset + 1)
+    # If there is no auxiliary data, `aux_offset + 1` is `length(data) + 2`
+    start = min((record.aux_offset % Int) + 1, length(record.data) + 1)
+    return XAMAuxData.SAM.Auxiliary(record.data, start)
 end
 
 function left_position(record::SAMRecord)::Union{Int, Nothing}
-    result = record.pos
+    result = record.pos % Int
     return iszero(result) ? nothing : result
 end
 
 """
     mutable struct SAMReader{T <: AbstractBufReader}
-    
+
 Lazy reader of SAM files.
 
 `rdr = SAMReader` is an iterator over `SAMRecord`.
@@ -527,8 +588,8 @@ function SAMReader(f::Function, args...; kwargs...)
 end
 
 function Base.close(reader::SAMReader)
-    close(reader.reader)
-    return reader.error = nothing
+    reader.error = XAMErrors.closed_stream
+    return close(reader.reader)
 end
 
 get_header(reader::SAMReader) = reader.header
@@ -568,6 +629,8 @@ end
 function seek_first_record(reader::SAMReader)
     seek(reader.reader, reader.offset_first_record)
     reset!(reader.record)
+    # Errors are sticky until the reader is seeked, except if it's closed
+    reader.error == XAMErrors.closed_stream || (reader.error = nothing)
     return reader
 end
 
@@ -583,7 +646,7 @@ function Base.iterate(reader::SAMReader, _::Nothing = nothing)
 end
 
 """
-    XAM2.try_read(reader::SAMReader)::Union{SAMRecord, Nothing, XAMErrorKind}
+    XAM2.try_read!(reader::SAMReader)::Union{SAMRecord, Nothing, XAMErrorKind}
 
 Attempt to read the next record of `reader`, similar to iterating the reader.
 If the reader is EOF, return `nothing`.
@@ -591,20 +654,25 @@ If the next record is malformed, return a `XAMErrorKind`.
 Once this function returns a `XAMErrorKind`, subsequent calls to this function
 will return the same error until the reader is closed or seeked.
 
+The record is parsed with [`XAM2.try_parse!`](@ref), see its documentation for
+what is validated.
+
 This function does not throw if the reader's data is malformed.
 """
 function try_read!(reader::SAMReader)::Union{SAMRecord, Nothing, XAMErrorKind}
-    # Get a view of the current line, stripped from newline
     isnothing(reader.error) || return reader.error
+    # Get a view of the current line, stripped from newline
     line_view = get_next_line_view(reader.reader)
     line_view === nothing && return nothing
-    stripped = _chomp(line_view)
-    result = try_parse_record!(reader.record, stripped)
+    result = try_parse!(reader.record, _chomp(line_view))
     @inbounds consume(reader.reader, length(line_view))
+    # On failure, `try_parse!` has already reset the record
+    result isa XAMErrorKind && (reader.error = result)
     return result
 end
 
-function get_next_line_view(
+# Inlined, so the returned `Union` is not allocated
+@inline function get_next_line_view(
         reader::AbstractBufReader
     )::Union{ImmutableMemoryView{UInt8}, Nothing}
     scan_from = 1

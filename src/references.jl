@@ -155,10 +155,8 @@ function References(header::SAMHeader)
     stringvec = StringVec()
     reflens = Vector{Int32}(undef, length(header.seqs))
     for (i, sq) in enumerate(header.seqs)
-        push_codeunits!(stringvec, sq.sn)
-        if iszero(sq.ln) || sq.ln > typemax(Int32) % UInt32
-            throw(ArgumentError("Reference length must be in 1:2147483647"))
-        end
+        # The header parser validated the names and lengths, and that names are unique
+        push!(stringvec, sq.sn)
         reflens[i] = sq.ln % Int32
     end
     return unwrap_references(try_build_references(stringvec, reflens))
@@ -175,18 +173,20 @@ function unwrap_references(x::Union{References, XAMErrorKind})::References
     throw(ArgumentError(msg))
 end
 
-# Check that the @SQ lines of the header, if any, agree with `refs`.
-function check_header_references(header::SAMHeader, refs::References)::Nothing
+# Check if the @SQ lines of the header, if any, agree with `refs`.
+function header_matches_references(header::SAMHeader, refs::References)::Bool
     seqs = header.seqs
-    isempty(seqs) && return nothing
-    if length(seqs) != length(refs)
-        throw(ArgumentError("Number of @SQ lines in header does not match number of references"))
+    isempty(seqs) && return true
+    length(seqs) == length(refs) || return false
+    for (sq, ref) in zip(seqs, refs)
+        (sq.sn == ref.name && sq.ln == ref.length) || return false
     end
-    for (i, sq) in enumerate(seqs)
-        ref = @inbounds refs[i]
-        if sq.sn != codeunits(ref.name) || sq.ln != ref.length
-            throw(ArgumentError("@SQ line $(i) in header does not match reference $(i)"))
-        end
+    return true
+end
+
+function check_header_references(header::SAMHeader, refs::References)::Nothing
+    if !header_matches_references(header, refs)
+        throw(ArgumentError("@SQ lines in header do not match the references"))
     end
     return nothing
 end

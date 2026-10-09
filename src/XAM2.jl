@@ -96,21 +96,28 @@ module XAMErrors
         header_truncated
         header_bad_magic_bytes
         header_top_bit_set
+        header_reference_mismatch # @SQ lines in BAM header differ from binary references
         invalid_cigar
-        missing_fields # not enough tab fields
-        invalid_integer
-        overflow
+        missing_fields # SAM line has fewer than 11 fields
         line_too_long # more than 4 GiB line
-        qname_too_long
-        qual_no_seq
-        qual_seq_mismatch
+        qual_no_seq # SAM record has a quality, but no sequence
+        qual_seq_mismatch # SAM record's quality and sequence have different lengths
         invalid_reference # reference with invalid name or length
         duplicate_reference # two references with the same name
         invalid_reference_id # record has a reference ID outside the references
         unknown_reference # record's reference is not present in the destination
         reference_length_mismatch # same reference name, but different lengths
-        invalid_read_name # read name length is zero, or not null terminated
-        invalid_position # position is less than -1
+        invalid_read_name # BAM: length is zero, or not null terminated. SAM: invalid QNAME
+        invalid_flags # SAM FLAG
+        invalid_reference_name # SAM RNAME
+        invalid_position # position is less than -1 (BAM), or invalid POS (SAM)
+        invalid_mapq # SAM MAPQ
+        invalid_next_reference_name # SAM RNEXT
+        invalid_next_position # next position is less than -1 (BAM), or invalid PNEXT (SAM)
+        invalid_template_length # SAM TLEN
+        invalid_sequence # SAM SEQ
+        invalid_quality # SAM QUAL
+        invalid_aux_data # SAM auxiliary fields
         cigar_query_length_mismatch # CIGAR's query length differs from sequence length
         record_too_long # BAM record's block size does not fit in 32 bits
     end
@@ -133,14 +140,74 @@ end
 
 @noinline throw_xam_error(kind::XAMErrorKind) = throw(XAMError(kind))
 
-function Base.showerror(io::IO, error::XAMError)
-    kind = error.kind
-    s = if kind == XAMErrors.truncated_file
-        "Input data too is truncated; does not contain whole record or header"
-    elseif kind == XAMErrors.invalid_block_length
-        unreachable()
+function error_message(kind::XAMErrorKind)::String
+    E = XAMErrors
+    return if kind == E.truncated_file
+        "input data is truncated; does not contain whole record or header"
+    elseif kind == E.invalid_block_length
+        "BAM record's block size is too small to contain its fields"
+    elseif kind == E.closed_stream
+        "stream is closed"
+    elseif kind == E.header_truncated
+        "BAM header is truncated"
+    elseif kind == E.header_bad_magic_bytes
+        "data does not begin with the BAM magic bytes"
+    elseif kind == E.header_top_bit_set
+        "header text length or number of references in BAM header exceeds 2147483647"
+    elseif kind == E.header_reference_mismatch
+        "@SQ lines in BAM header do not match the reference sequences in the binary header"
+    elseif kind == E.invalid_cigar
+        "invalid CIGAR"
+    elseif kind == E.missing_fields
+        "SAM record has fewer than 11 tab-separated fields"
+    elseif kind == E.line_too_long
+        "SAM line is longer than 4294967295 bytes"
+    elseif kind == E.qual_no_seq
+        "SAM record has a quality (QUAL), but no sequence (SEQ)"
+    elseif kind == E.qual_seq_mismatch
+        "SAM record's quality (QUAL) and sequence (SEQ) have different lengths"
+    elseif kind == E.invalid_reference
+        "reference sequence has an invalid name or length"
+    elseif kind == E.duplicate_reference
+        "two reference sequences have the same name"
+    elseif kind == E.invalid_reference_id
+        "record's reference ID is not in the references"
+    elseif kind == E.unknown_reference
+        "record's reference is not present in the destination's references"
+    elseif kind == E.reference_length_mismatch
+        "record's reference has a different length in the destination's references"
+    elseif kind == E.invalid_read_name
+        "invalid read name (QNAME)"
+    elseif kind == E.invalid_flags
+        "invalid flags (FLAG)"
+    elseif kind == E.invalid_reference_name
+        "invalid reference name (RNAME)"
+    elseif kind == E.invalid_position
+        "invalid position (POS)"
+    elseif kind == E.invalid_mapq
+        "invalid mapping quality (MAPQ)"
+    elseif kind == E.invalid_next_reference_name
+        "invalid next reference name (RNEXT)"
+    elseif kind == E.invalid_next_position
+        "invalid next position (PNEXT)"
+    elseif kind == E.invalid_template_length
+        "invalid template length (TLEN)"
+    elseif kind == E.invalid_sequence
+        "invalid sequence (SEQ)"
+    elseif kind == E.invalid_quality
+        "invalid quality (QUAL)"
+    elseif kind == E.invalid_aux_data
+        "invalid auxiliary data"
+    elseif kind == E.cigar_query_length_mismatch
+        "query length of CIGAR differs from the length of the sequence"
+    else
+        @assert kind == E.record_too_long
+        "BAM record is longer than 4294967295 bytes"
     end
-    return print(io, s)
+end
+
+function Base.showerror(io::IO, error::XAMError)
+    return print(io, "XAMError: ", error_message(error.kind))
 end
 
 struct Uninit end

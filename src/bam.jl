@@ -339,8 +339,10 @@ function parse_bam_header!(
     memview = fill_bytes_to_data!(reader, buffer, l_text % Int + 4)
     isnothing(memview) && return XAMErrors.header_truncated
 
-    # Copy the header because we need to store the data in the reader
-    header_view = copy(@inbounds(memview[1:(end - 4)]))
+    # The text may be padded with null bytes, which are not part of the header.
+    # Copy the header because we need to store the data in the reader.
+    text_len = something(findlast(!iszero, @inbounds(memview[1:(end - 4)])), 0)
+    header_view = copy(@inbounds(memview[1:text_len]))
 
     header = try_parse_header(header_view)
     header isa SAMHeaderError && return header
@@ -371,6 +373,8 @@ function parse_bam_header!(
 
     refs = try_build_references(stringvec, reflens)
     refs isa XAMErrorKind && return refs
+    # The binary references are used for records, but the text header must not disagree
+    header_matches_references(header, refs) || return XAMErrors.header_reference_mismatch
     return (; header, refs)
 end
 
@@ -710,7 +714,8 @@ function check_fixed_fields(record::BAMRecord, stored_block_size::UInt32)::Union
     n_refs = length(record.refs)
     is_valid_reference_id(record.refID, n_refs) || return XAMErrors.invalid_reference_id
     is_valid_reference_id(record.next_refID, n_refs) || return XAMErrors.invalid_reference_id
-    (record.pos < -1 || record.next_pos < -1) && return XAMErrors.invalid_position
+    record.pos < -1 && return XAMErrors.invalid_position
+    record.next_pos < -1 && return XAMErrors.invalid_next_position
     # Computed as Int, so it can't overflow
     l_seq = record.l_seq % Int
     min_len = record.l_read_name % Int + 4 * (record.n_cigar_op % Int) + cld(l_seq, 2) + l_seq
@@ -1113,10 +1118,9 @@ function append_number_field!(
     )::Int
     if n == typemin(n)
         s = min_string(typemin(n))
-        old_len = length(data)
-        sizehint!(data, old_len + sizeof(s) + 1; shrink = true)
         append!(data, codeunits(s))
-        @inbounds data[end] = UInt8('\t')
+        push!(data, UInt8('\t'))
+        return length(data)
     else
         if n < zero(n)
             push!(data, UInt8('-'))
@@ -1138,8 +1142,15 @@ function append_optional_string_field!(data::Vector{UInt8}, field::Union{Nothing
 end
 
 function Base.copy!(dst::SAMRecord, src::BAMRecord)
+    # Throw before modifying `dst`, so it's never left in an invalid state
+    cig = cigar(src)
+    cig isa CIGARError && throw_xam_error(XAMErrors.invalid_cigar)
+    cig isa XAMErrorKind && throw_xam_error(cig)
+
     data = dst.data
     empty!(data)
+    # The CIGAR is not cached, because it would alias `data`, which is resized below
+    dst.cigar = Uninit()
 
     # QNAME
     n = append_optional_string_field!(data, query_name(src))
@@ -1152,7 +1163,8 @@ function Base.copy!(dst::SAMRecord, src::BAMRecord)
     # RNAME
     rname_start = (length(data) + 1) % UInt32
     rname_len_p1 = append_optional_string_field!(data, reference_name(src))
-    dst.rname_span = (rname_start, (rname_start + rname_len_p1 - 1) % UInt32)
+    # The length includes the tab
+    dst.rname_span = (rname_start, (rname_start + rname_len_p1 - 2) % UInt32)
 
     # POS
     dst.pos = src.pos + UInt32(1)
@@ -1164,29 +1176,24 @@ function Base.copy!(dst::SAMRecord, src::BAMRecord)
 
     # CIGAR
     dst.cigar_offset = length(data) % UInt32
-    cig = cigar(src)
-    if cig isa CIGARError
-        throw_xam_error(XAMErrors.invalid_cigar)
-    elseif cig isa XAMErrorKind
-        throw_xam_error(cig)
-    elseif cig === nothing
+    if cig === nothing
         push!(data, UInt8('*'))
     else
-        dst.cigar = CIGARStrings.encode_append!(data, CIGAR, cig)
+        CIGARStrings.encode_append!(data, CIGAR, cig)
     end
     push!(data, UInt8('\t'))
 
     # RNEXT
-    if src.refID == src.next_refID
+    if src.refID ≥ 0 && src.refID == src.next_refID
         # If RNAME and RNEXT is the same, we write it as `=`
-        idx = length(data + 1) % UInt32
+        idx = (length(data) + 1) % UInt32
         dst.rnext_span = (idx, idx)
-        push!(data, UInt8("="))
-        push!(data, UInt8("\t"))
+        push!(data, UInt8('='))
+        push!(data, UInt8('\t'))
     else
         rnext_start = (length(data) + 1) % UInt32
         rnext_name_len_p1 = append_optional_string_field!(data, next_reference_name(src))
-        dst.rnext_span = (rnext_start, (rnext_start + rnext_name_len_p1 - 1) % UInt32)
+        dst.rnext_span = (rnext_start, (rnext_start + rnext_name_len_p1 - 2) % UInt32)
     end
 
     # PNEXT
