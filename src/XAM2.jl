@@ -61,12 +61,11 @@ export BAMRecord,
     XAMErrors
 
 public try_parse!,
+    try_parse_header,
     HasEq,
     SAMHeaderError
-try_parse_header,
 
-
-    """
+"""
         module XAMErrors
 
     This module is used as a namespace for the [`XAMErrorKind`](@ref) enum.
