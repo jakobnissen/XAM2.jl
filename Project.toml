@@ -18,6 +18,7 @@ BioSequences = "7e6ae17a-c86d-528c-b3b9-7f778a29fe59"
 
 [sources]
 BGZFLib = {path = "../BGZFLib.jl"}
+BufferIO = {path = "../BufferIO.jl"}
 XAMAuxData = {path = "../XAMAuxData.jl"}
 
 [extensions]
@@ -27,7 +28,7 @@ BioSequencesExt = "BioSequences"
 Automa = "1.1.0"
 BGZFLib = "0.2.0"
 BioSequences = "3.5.0"
-BufferIO = "0.2.6"
+BufferIO = "0.2.7"
 CIGARStrings = "0.2.0"
 MemoryViews = "0.5.0"
 StringViews = "2"

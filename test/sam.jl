@@ -309,50 +309,74 @@ end
         @test !isopen(io)
     end
 
-    @testset "Lines that don't fit in the buffer" begin
-        header = "@HD\tVN:1.6\n@CO\tx\n"
+    @testset "Readers that can't buffer a whole line" begin
+        header = "@HD\tVN:1.6\n@CO\t" * "x"^100 * "\n"
         short = sam_line(VALID_FIELDS)
         long = sam_line(["r2"; VALID_FIELDS[2:9]; "A"^100; "I"^100])
         data = header * join([short, long, short], '\n')
+        expected = map(summarize, SAMReader(collect, IOBuffer(data)))
+        @test length(expected) == 3
 
-        # The buffer must hold the newline to find the end of the line, except at EOF
-        @test length(SAMReader(collect, LimitedBufReader(data, length(long) + 1))) == 3
-        @test length(SAMReader(collect, LimitedBufReader(header * long, length(long)))) == 1
-        reader = SAMReader(LimitedBufReader(data, length(long)))
-        @test XAM2.try_read!(reader) isa SAMRecord
-        @test error_kind(XAM2.try_read!(reader)) == XAMErrors.line_too_long
-
-        reader = SAMReader(LimitedBufReader(data, length(short) + 1))
-        @test query_name(XAM2.try_read!(reader)) == "r1"
-        expected = XAMError(XAMErrors.line_too_long; record = 2, line = 4)
-        @test XAM2.try_read!(reader) == expected
-        @test XAM2.try_read!(reader) === expected
-        @test_throws XAMError iterate(reader)
-
-        # Header lines
-        @test XAM2.try_init(SAMReader, LimitedBufReader("@HD\tVN:1.6\n@CO\t" * "x"^100, 50)) ==
-            XAMError(XAMErrors.line_too_long; line = 2)
-
-        # A BGZFReader can't expand its buffer, so it can't read lines across blocks
-        mktempdir() do dir
-            path = joinpath(dir, "file.sam.gz")
-            # Large enough that lines cross BGZF block boundaries
-            n_records = 10_000
-            BGZFWriter(open(path, "w")) do writer
-                write(writer, header)
-                for _ in 1:n_records
-                    write(writer, short, '\n')
+        # Lines longer than the buffer, including header lines, and CRLF line endings,
+        # where the buffer may end between the CR and LF.
+        for text in (data, replace(data, '\n' => "\r\n"))
+            for max_size in (1, 2, 7, length(short), length(short) + 1, length(long), length(long) + 1)
+                SAMReader(LimitedBufReader(text, max_size)) do reader
+                    @test only(get_header(reader).comments) == "x"^100
+                    @test map(summarize, reader) == expected
                 end
             end
-            records = SAMReader(open(path) |> BGZFReader) do reader
-                result = nothing
-                while true
-                    result = XAM2.try_read!(reader)
-                    result isa SAMRecord || break
+        end
+
+        @testset "Maximum line length" begin
+            get_line(s, max_length) = XAM2.get_next_line_view(XAM2.BufferIO.ExpandReader(LimitedBufReader(s, 2)), max_length)
+            @test get_line("abcd\nef", 4) == ImmutableMemoryView("abcd\n")
+            @test get_line("abcd\r\nef", 4) == ImmutableMemoryView("abcd\r\n")
+            @test get_line("abcd", 4) == ImmutableMemoryView("abcd")
+            @test get_line("", 4) === nothing
+            # Without newlines, buffering stops when the line is too long
+            @test get_line("a"^10_000, 4) == XAMErrors.line_too_long
+            @test get_line("a"^10_000 * "\n", 100) == XAMErrors.line_too_long
+        end
+
+        @testset "Bgzipped SAM" begin
+            mktempdir() do dir
+                # Large enough that lines cross BGZF block boundaries
+                path = joinpath(dir, "file.sam.gz")
+                n_records = 10_000
+                BGZFWriter(open(path, "w")) do writer
+                    write(writer, header)
+                    for _ in 1:n_records
+                        write(writer, short, '\n')
+                    end
                 end
-                result
+                records = SAMReader(collect, BGZFReader(open(path); n_workers = 1))
+                @test length(records) == n_records
+                @test all(r -> summarize(r) == expected[1], records)
+
+                # Block boundaries inside a header line and a record line.
+                # Each chunk is compressed to its own blocks.
+                function bgzf_chunks(splits...)
+                    bounds = [0; collect(splits); ncodeunits(data)]
+                    chunks = [codeunits(data)[(bounds[i] + 1):bounds[i + 1]] for i in 1:(length(bounds) - 1)]
+                    return [bgzf_compress(dir, collect(chunk)) for chunk in chunks]
+                end
+                record_start = ncodeunits(header)
+                bytes = reduce(vcat, bgzf_chunks(5, record_start + 10))
+                SAMReader(BGZFReader(IOBuffer(bytes); n_workers = 1)) do reader
+                    @test only(get_header(reader).comments) == "x"^100
+                    @test map(summarize, reader) == expected
+                end
+
+                # Malformed data in the block after the line's first block is thrown
+                long_start = record_start + ncodeunits(short) + 1
+                blocks = bgzf_chunks(long_start + 10)
+                corrupt_crc!(blocks[2])
+                reader = SAMReader(BGZFReader(IOBuffer(reduce(vcat, blocks)); n_workers = 1))
+                @test query_name(XAM2.try_read!(reader)) == "r1"
+                @test_throws BGZFError XAM2.try_read!(reader)
+                close(reader)
             end
-            @test error_kind(records) == XAMErrors.line_too_long
         end
     end
 end

@@ -90,6 +90,10 @@ const SAM_ACTIONS = Dict{Symbol, Expr}(
     end,
 )
 
+# Maximum length of a SAM line, excluding its newline, such that offsets into the line
+# fit in a `UInt32`
+const MAX_SAM_LINE_LENGTH = (typemax(UInt32) - 1) % Int
+
 """
     SAMRecord
 
@@ -124,7 +128,7 @@ mutable struct SAMRecord
     # e.g. using `@inbounds`. Records from `try_parse!` are checked by `SAM_MACHINE`, and
     # records created any other way are valid by construction.
     # The fields of `SAMRecord` are internal, so users can't violate these.
-    # 1. `length(data) < typemax(UInt32)`
+    # 1. `length(data) <= MAX_SAM_LINE_LENGTH`
     # 2. `data` is a SAM line without the trailing newline, with 11 or more tab-separated
     #    fields, and the offsets below point to the correct fields, as described in
     #    their comments.
@@ -179,7 +183,7 @@ of the invalid byte, or the start of the field if its value is out of range.
 This function does not throw if `data` is malformed.
 """
 function try_parse!(record::SAMRecord, data::ImmutableMemoryView{UInt8})::Union{SAMRecord, XAMError}
-    err = if length(data) ≥ typemax(UInt32)
+    err = if length(data) > MAX_SAM_LINE_LENGTH
         XAMError(XAMErrors.line_too_long)
     else
         copyto!(resize!(record.data, length(data)), data)
@@ -615,12 +619,13 @@ If `copy` is `false`, every record returned by iterating the reader or from
 efficiency, but new records will invalidate every previous one.
 To prevent aliasing, `copy` can be called manually on records.
 
-The buffer of `io` must be able to hold an entire line. A line that doesn't fit gives
-an `XAMError` of kind `XAMErrors.line_too_long`. Note that a `BGZFReader` can't expand
-its buffer, so it can't read lines that cross the boundary of a BGZF block.
+`io` may be any `AbstractBufReader`, including one that can't expand its buffer to
+hold an entire line, such as a `BGZFReader` reading bgzipped SAM.
 """
 mutable struct SAMReader{T <: AbstractBufReader}
-    const reader::T
+    # Wrapping the reader lets us buffer whole lines, even if the inner reader can't.
+    # If the inner reader can expand its buffer, the `ExpandReader` forwards it.
+    const reader::ExpandReader{T}
     const record::SAMRecord
     const offset_first_record::Int
     const header::SAMHeader
@@ -658,6 +663,10 @@ end
 function try_init end
 
 function try_init(::Type{SAMReader}, reader::AbstractBufReader; copy::Bool = true)::Union{SAMReader, XAMError}
+    return try_init(SAMReader, ExpandReader(reader); copy)
+end
+
+function try_init(::Type{SAMReader}, reader::ExpandReader{T}; copy::Bool = true)::Union{SAMReader{T}, XAMError} where {T}
     header = close_on_throw(() -> read_initial_sam_header!(reader), reader)
     if header isa XAMError
         close(reader)
@@ -665,7 +674,7 @@ function try_init(::Type{SAMReader}, reader::AbstractBufReader; copy::Bool = tru
     end
     data = MemoryView(header)
     n_header_lines = count(==(UInt8('\n')), data)
-    return SAMReader{typeof(reader)}(reader, SAMRecord(), length(data), header, n_header_lines, copy, 0, nothing)
+    return SAMReader{T}(reader, SAMRecord(), length(data), header, n_header_lines, copy, 0, nothing)
 end
 
 function try_init(::Type{SAMReader}, io::IO; copy::Bool = true)::Union{SAMReader, XAMError}
@@ -706,7 +715,7 @@ function Base.show(io::IO, ::MIME"text/plain", reader::SAMReader)
     return print(io, "TODO!")
 end
 
-function read_initial_sam_header!(reader::AbstractBufReader)::Union{SAMHeader, XAMError}
+function read_initial_sam_header!(reader::ExpandReader)::Union{SAMHeader, XAMError}
     # We need to store a copy of the underlying data, and can't just store
     # a view into the reader, because we mutate the reader
     # TODO: Is it too inefficient to do two passes over the header, one to
@@ -784,16 +793,12 @@ end
 end
 
 # Return a view of the next line in the buffer, including the trailing newline, if any.
-# Return `nothing` if `reader` is EOF, or `XAMErrors.line_too_long` if the line doesn't
-# fit in the buffer of `reader`.
-# TODO: This makes bgzipped SAM unreadable, since a `BGZFReader` can't expand its buffer,
-# so a line crossing a BGZF block boundary gives `line_too_long`. This should be handled
-# upstream: BufferIO should have a reader that wraps an `AbstractBufReader` and has a
-# growable buffer, e.g. `BufReader(::AbstractBufReader)`. Wrapping as
-# `BufReader(IOReader(bgzf))` currently fails with a `readbytes!` method ambiguity
-# between BufferIO and MemoryViews.
+# Return `nothing` if `reader` is EOF, or `XAMErrors.line_too_long` if the line, excluding
+# its newline, is longer than `max_length` bytes. This bounds the memory used to buffer
+# the line, e.g. if the input has no newlines.
 function get_next_line_view(
-        reader::AbstractBufReader
+        reader::ExpandReader,
+        max_length::Int = MAX_SAM_LINE_LENGTH,
     )::Union{ImmutableMemoryView{UInt8}, Nothing, XAMErrorKind}
     scan_from = 1
     buffer = get_buffer(reader)::ImmutableMemoryView{UInt8}
@@ -802,9 +807,12 @@ function get_next_line_view(
         if pos !== nothing
             return @inbounds(buffer[1:pos])
         end
+        # The line is at least `length(buffer) - 1` bytes, since the last byte may be
+        # the carriage return of a CRLF.
+        length(buffer) - 1 > max_length && return XAMErrors.line_too_long
         scan_from = length(buffer) + 1
-        n_filled = fill_buffer(reader)
-        n_filled === nothing && return XAMErrors.line_too_long
+        # An `ExpandReader` can always expand its buffer, so this never returns `nothing`
+        fill_buffer(reader)::Int
         new_buffer = get_buffer(reader)::ImmutableMemoryView{UInt8}
         if length(new_buffer) ≤ length(buffer)
             return isempty(new_buffer) ? nothing : new_buffer

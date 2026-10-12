@@ -1465,6 +1465,6 @@ function try_copy_kind!(dst::SAMRecord, src::BAMRecord)::Union{SAMRecord, XAMErr
     end
 
     # Invariant of `SAMRecord`
-    length(data) < typemax(UInt32) || return XAMErrors.line_too_long
+    length(data) ≤ MAX_SAM_LINE_LENGTH || return XAMErrors.line_too_long
     return dst
 end

@@ -4,6 +4,7 @@ using BufferIO: BufferIO,
     AbstractBufReader,
     AbstractBufWriter,
     BufReader,
+    ExpandReader,
     VecWriter,
     get_nonempty_buffer,
     get_unflushed,
@@ -147,7 +148,7 @@ module XAMErrors
         invalid_block_length
         record_too_long # BAM record's block size, or a CIGAR placeholder length, does not fit
         missing_fields # SAM line has fewer than 11 fields
-        line_too_long # more than 4 GiB line, or doesn't fit in the reader's buffer
+        line_too_long # SAM line of 4 GiB or more
         qual_no_seq # SAM record has a quality, but no sequence
         qual_seq_mismatch # SAM record's quality and sequence have different lengths
         # Record fields
@@ -287,7 +288,7 @@ function error_message(kind::XAMErrorKind)::String
     elseif kind == E.missing_fields
         "SAM record has fewer than 11 tab-separated fields"
     elseif kind == E.line_too_long
-        "SAM line is longer than 4294967294 bytes, or than the reader's buffer can hold"
+        "SAM line is longer than 4294967294 bytes"
     elseif kind == E.qual_no_seq
         "SAM record has a quality (QUAL), but no sequence (SEQ)"
     elseif kind == E.qual_seq_mismatch
