@@ -245,11 +245,6 @@ end
         @test References(header) == references(BAMReader(open(EXAMPLE_BAM); n_workers = 1))
         @test only(header.comments) == "An example comment"
         @test MemoryView(header) == MemoryView(get_header(BAMReader(open(EXAMPLE_BAM); n_workers = 1)))
-
-        # Seeking back reads the same records again
-        first_pass = map(summarize, reader)
-        seek_first_record(reader)
-        @test map(summarize, reader) == first_pass
     end
 
     # Copying BAM records to SAM records reproduces the SAM lines
@@ -283,11 +278,6 @@ end
         @test sprint(showerror, expected) ==
             "XAMError: invalid position (POS) at record 2, line 4, column 12"
         @test_throws XAMError iterate(reader)
-
-        # Seeking clears the error
-        seek_first_record(reader)
-        @test query_name(XAM2.try_read!(reader)) == "r1"
-        @test XAM2.try_read!(reader) == expected
 
         # Closing sets a permanent error
         close(reader)

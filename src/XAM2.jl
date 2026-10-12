@@ -528,7 +528,7 @@ function check_query_length(cig::T, seq_len::Int)::Union{T, XAMError} where {T <
 end
 
 """
-    seek_first_record(reader::Union{SAMReader, BAMReader}) -> reader
+    seek_first_record(reader::BAMReader) -> reader
 
 Seek `reader` back to the first record.
 """

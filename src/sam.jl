@@ -627,7 +627,6 @@ mutable struct SAMReader{T <: AbstractBufReader}
     # If the inner reader can expand its buffer, the `ExpandReader` forwards it.
     const reader::ExpandReader{T}
     const record::SAMRecord
-    const offset_first_record::Int
     const header::SAMHeader
     # Number of lines in the header, used to compute line numbers of records
     const n_header_lines::Int
@@ -672,9 +671,8 @@ function try_init(::Type{SAMReader}, reader::ExpandReader{T}; copy::Bool = true)
         close(reader)
         return header
     end
-    data = MemoryView(header)
-    n_header_lines = count(==(UInt8('\n')), data)
-    return SAMReader{T}(reader, SAMRecord(), length(data), header, n_header_lines, copy, 0, nothing)
+    n_header_lines = count(==(UInt8('\n')), MemoryView(header))
+    return SAMReader{T}(reader, SAMRecord(), header, n_header_lines, copy, 0, nothing)
 end
 
 function try_init(::Type{SAMReader}, io::IO; copy::Bool = true)::Union{SAMReader, XAMError}
@@ -737,14 +735,6 @@ function read_initial_sam_header!(reader::ExpandReader)::Union{SAMHeader, XAMErr
     return try_parse_header(ImmutableMemoryView(get_unflushed(buffer)))
 end
 
-function seek_first_record(reader::SAMReader)
-    seek(reader.reader, reader.offset_first_record)
-    reset!(reader.record)
-    reader.n_records = 0
-    clear_error!(reader)
-    return reader
-end
-
 Base.IteratorSize(::Type{<:SAMReader}) = Base.SizeUnknown()
 Base.eltype(::Type{<:SAMReader}) = SAMRecord
 
@@ -764,7 +754,7 @@ If the reader is EOF, return `nothing`.
 If the next record is malformed, return an `XAMError`, with the record number,
 line and column of the error.
 Once this function returns an `XAMError`, subsequent calls to this function
-will return the same error until the reader is closed or seeked.
+will return the same error, or a `closed_stream` error once the reader is closed.
 
 The record is parsed with [`XAM2.try_parse!`](@ref), see its documentation for
 what is validated.
