@@ -35,12 +35,12 @@ end
         @test Integer(flags(record)) == 99
         @test reference_name(record) == "chr1"
         @test left_position(record) === 5
-        @test record.mapq == 60
+        @test mapping_quality(record) === 60
         @test String(MemoryView(XAM2.cigar(record))) == "4M"
         # Regression: RNEXT overwrote RNAME
         @test next_reference_name(record) == "chr2"
-        @test record.pnext == 20
-        @test record.tlen == -19
+        @test next_position(record) === 20
+        @test template_length(record) === -19
         @test sequence(record) == "ACGT"
         @test quality_string(record) == "IIII"
         @test collect(aux_data(record)) == [AuxTag("NM") => 0, AuxTag("XA") => "hello world"]
@@ -50,12 +50,14 @@ end
         record = try_parse_line("*\t4\t*\t0\t0\t*\t*\t0\t0\t*\t*")
         @test is_reset(record)
         @test left_position(record) === nothing
-        @test record.mapq == 0
+        @test next_position(record) === nothing
+        @test mapping_quality(record) === 0
+        @test template_length(record) === nothing
 
         # Special values
         record = try_parse_line(sam_line(["r", "0", "chr1", "1", "0", "*", "=", "0", "+5", "AC=.n", "*"]))
         @test next_reference_name(record) == "chr1"
-        @test record.tlen == 5
+        @test template_length(record) == 5
         @test sequence(record) == "AC=.n"
         @test quality_string(record) === nothing
         @test XAM2.cigar(record) === nothing
@@ -74,9 +76,10 @@ end
         @test length(query_name(record)) == 254
         @test reference_name(record) == "a*="
         @test left_position(record) == typemax(Int32)
-        @test record.mapq == 255
-        @test record.tlen == typemin(Int32)
-        @test try_parse_line(with_field(9, "2147483647")).tlen == typemax(Int32)
+        @test next_position(record) == typemax(Int32)
+        @test mapping_quality(record) === nothing
+        @test template_length(record) == typemin(Int32)
+        @test template_length(try_parse_line(with_field(9, "2147483647"))) == typemax(Int32)
 
         # The CIGAR is validated lazily
         record = try_parse_line(with_field(6, "3M"))
@@ -207,6 +210,9 @@ summarize(r::SAMRecord) = (
     @test records isa Vector{SAMRecord}
     @test map(summarize, records) == map(summarize, bam_records)
     @test map(mapping_span, records) == map(mapping_span, bam_records)
+    for f in (next_position, mapping_quality, template_length)
+        @test map(f, records) == map(f, bam_records)
+    end
     @test map(quality_string, records) ==
         [q === nothing ? nothing : String(q .+ UInt8(33)) for q in map(quality_scores, bam_records)]
 

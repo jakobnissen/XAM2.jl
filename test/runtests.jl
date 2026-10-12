@@ -105,6 +105,19 @@ end
     @test map(r -> String(MemoryView(CIGAR(XAM2.cigar(r)))), records[1:5]) == ["4M", "2M1I1M", "3M2S", "5M", "3M1D2M"]
     @test XAM2.cigar(records[6]) === nothing
     @test map(reference_length, records) == [1000, 1000, 1000, 500, 2000, nothing]
+    @test map(reference_index, records) == [1, 1, 1, 2, 3, nothing]
+    @test map(next_reference_index, records) == [1, 1, 2, 1, nothing, nothing]
+    @test map(next_position, records) == [20, 5, 50, 100, nothing, nothing]
+    @test map(mapping_quality, records) == [60, 60, 30, 30, nothing, 0]
+    @test map(template_length, records) == [19, -19, nothing, nothing, nothing, nothing]
+    @test all(r -> references(r) === references(reader), records)
+    for r in records[1:5]
+        @test references(r)[reference_index(r)] == XAM2.reference(r)
+    end
+    for r in records[1:4]
+        @test references(r)[next_reference_index(r)].name == next_reference_name(r)
+    end
+    @test XAM2.reference(records[6]) === nothing
     @test quality_scores(records[2]) == [0x02, 0x03, 0x04, 0x05]
     @test quality_scores(records[3]) === nothing
     @test String(aux_data(records[5])["XA"]) == "hello"
@@ -233,3 +246,4 @@ include("malformed.jl")
 include("header.jl")
 include("sam.jl")
 include("convert.jl")
+include("qualityview.jl")

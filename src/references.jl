@@ -69,7 +69,7 @@ struct References <: AbstractVector{Reference}
 end
 
 """
-    references(x::Union{BAMReader, BAMWriter})::References
+    references(x::Union{BAMReader, BAMWriter, BAMRecord})::References
 
 Get the reference sequences of `x`.
 """

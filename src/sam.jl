@@ -519,18 +519,39 @@ function sequence(record::SAMRecord)::Union{AbstractString, Nothing}
 end
 
 """
-    quality_string(record::SAMRecord)::Union{Nothing, AbstractString}
+    quality_string(record::SAMRecord)::Union{Nothing, StringView{ImmutableMemoryView{UInt8}}}
 
-Return the quality as a PHRED+33-encoded `AbstractString`,
-or `nothing` if the quality is not available.
+Return the quality of `record` as a PHRED+33-encoded string, i.e. its QUAL field,
+or `nothing` if the quality is missing (`*`).
+
+See also: [`quality_scores`](@ref)
 
 !!! warning
     The returned string aliases the record.
     Mutating the record will invalidate the quality string.
 """
-function quality_string(record::SAMRecord)::Union{Nothing, AbstractString}
+function quality_string(record::SAMRecord)::Union{Nothing, StringView{ImmutableMemoryView{UInt8}}}
     view = qual_view(record)
     return is_missing(view) ? nothing : StringView(view)
+end
+
+"""
+    quality_scores(record::SAMRecord)::Union{Nothing, QualityView}
+
+Return the PHRED quality scores of `record`, or `nothing` if the quality is missing (`*`).
+
+The scores have no offset, so e.g. a PHRED score of 31 is `UInt8(31)`, as opposed to
+`UInt8(31 + 33)` in the QUAL field. The scores are returned as a lazy
+[`XAM2.QualityView`](@ref), which subtracts 33 from the QUAL field on access.
+Use `collect` to materialize it to a `Vector{UInt8}`.
+
+!!! warning
+    The returned view aliases the record. Mutating the record will
+    invalidate the view.
+"""
+function quality_scores(record::SAMRecord)::Union{Nothing, QualityView}
+    view = qual_view(record)
+    return is_missing(view) ? nothing : sam_to_bam_quality(view)
 end
 
 """
@@ -555,6 +576,19 @@ end
 function left_position(record::SAMRecord)::Union{Int, Nothing}
     result = record.pos % Int
     return iszero(result) ? nothing : result
+end
+
+function next_position(record::SAMRecord)::Union{Int, Nothing}
+    result = record.pnext % Int
+    return iszero(result) ? nothing : result
+end
+
+function mapping_quality(record::SAMRecord)::Union{Int, Nothing}
+    return record.mapq == 0xff ? nothing : record.mapq % Int
+end
+
+function template_length(record::SAMRecord)::Union{Int, Nothing}
+    return iszero(record.tlen) ? nothing : record.tlen % Int
 end
 
 """

@@ -562,6 +562,62 @@ function next_reference_name(record::BAMRecord)::Union{Nothing, AbstractString}
     return @inbounds record.refs.names[record.next_refID + 1]
 end
 
+"""
+    references(record::BAMRecord)::References
+
+Get the reference sequences that the references of `record` refer to.
+Records read from a `BAMReader` share the reader's references.
+
+See also: [`reference_index`](@ref), [`next_reference_index`](@ref)
+"""
+references(record::BAMRecord) = record.refs
+
+"""
+    reference_index(record::BAMRecord)::Union{Nothing, Int}
+
+Return the 1-based index of the reference of `record` in [`references(record)`](@ref references),
+or `nothing` if the record has no reference.
+
+This is the reference ID (refID) of the BAM format plus one.
+
+# Examples
+```julia
+index = reference_index(record)
+if index !== nothing
+    @assert references(record)[index].name == reference_name(record)
+end
+```
+
+See also: [`reference`](@ref XAM2.reference), [`reference_name`](@ref), [`next_reference_index`](@ref)
+"""
+function reference_index(record::BAMRecord)::Union{Nothing, Int}
+    record.refID < 0 && return nothing
+    return (record.refID % Int) + 1
+end
+
+"""
+    next_reference_index(record::BAMRecord)::Union{Nothing, Int}
+
+Return the 1-based index of the reference of the next segment in the template (RNEXT)
+in [`references(record)`](@ref references), or `nothing` if it has no reference.
+
+This is the next reference ID (next_refID) of the BAM format plus one.
+
+See also: [`reference_index`](@ref), [`next_reference_name`](@ref)
+"""
+function next_reference_index(record::BAMRecord)::Union{Nothing, Int}
+    record.next_refID < 0 && return nothing
+    return (record.next_refID % Int) + 1
+end
+
+"""
+    XAM2.reference(record::BAMRecord)::Union{Nothing, Reference}
+
+Return the reference of `record`, with its name and length, or `nothing` if
+the record has no reference.
+
+See also: [`reference_index`](@ref), [`XAM2.Reference`](@ref)
+"""
 function reference(record::BAMRecord)::Union{Nothing, Reference}
     record.refID < 0 && return nothing
     return @inbounds record.refs[record.refID + 1]
@@ -635,15 +691,18 @@ end
 """
     quality_scores(record::BAMRecord)::Union{Nothing, ImmutableMemoryView{UInt8}}
 
-Return the quality as a PHRED-encoded memory view, or `nothing` if the quality is
-missing (set to all `0xFF`, or the sequence is missing).
+Return the PHRED quality scores of `record`, or `nothing` if the quality is
+missing (stored as all `0xff`, or the sequence is missing).
 
-Note that the returned quality does not have a PHRED offset, so e.g. a PHRED
-score of 31 is encoded as `UInt8(31)` as opposed to e.g. `UInt8(31 + 33)`.
+The scores have no offset, so e.g. a PHRED score of 31 is `UInt8(31)`, as opposed to
+`UInt8(31 + 33)` in SAM. They are stored like this in BAM, so this is a view of the
+record's data.
+
+See also: [`quality_string`](@ref)
 
 !!! warning
-    The returned array aliases the record. Mutating the record will
-    invalidate the array
+    The returned view aliases the record. Mutating the record will
+    invalidate the view.
 """
 function quality_scores(record::BAMRecord)::Union{Nothing, ImmutableMemoryView{UInt8}}
     iszero(record.l_seq) && return nothing
@@ -656,6 +715,24 @@ function quality_scores(record::BAMRecord)::Union{Nothing, ImmutableMemoryView{U
     else
         qual
     end
+end
+
+"""
+    quality_string(record::BAMRecord)::Union{Nothing, StringView{QualityView}}
+
+Return the quality of `record` as a PHRED+33-encoded string, as in the QUAL field of
+SAM, or `nothing` if the quality is missing (see [`quality_scores`](@ref)).
+
+The string is backed by a lazy [`XAM2.QualityView`](@ref), which adds 33 to the
+PHRED scores of the record on access. Use `String` to materialize it.
+
+!!! warning
+    The returned string aliases the record. Mutating the record will
+    invalidate the string.
+"""
+function quality_string(record::BAMRecord)::Union{Nothing, StringView{QualityView}}
+    qual = quality_scores(record)
+    return qual === nothing ? nothing : StringView(bam_to_sam_quality(qual))
 end
 
 """
@@ -683,9 +760,21 @@ const CIGAR_LUT = let
     u
 end
 
+# Invariant: pos >= -1 and next_pos >= -1
 function left_position(record::BAMRecord)::Union{Int, Nothing}
-    result = record.pos + 1
-    return iszero(result) ? nothing : result
+    return record.pos < 0 ? nothing : (record.pos % Int) + 1
+end
+
+function next_position(record::BAMRecord)::Union{Int, Nothing}
+    return record.next_pos < 0 ? nothing : (record.next_pos % Int) + 1
+end
+
+function mapping_quality(record::BAMRecord)::Union{Int, Nothing}
+    return record.mapq == 0xff ? nothing : record.mapq % Int
+end
+
+function template_length(record::BAMRecord)::Union{Int, Nothing}
+    return iszero(record.tlen) ? nothing : record.tlen % Int
 end
 
 function cigar(record::BAMRecord)::Union{Nothing, BAMCIGAR, CIGARError, XAMError}
@@ -1181,16 +1270,13 @@ function try_copy_kind!(dst::BAMRecord, src::SAMRecord)::Union{BAMRecord, XAMErr
     if l_seq > 0
         bamseq!(mem[(offset + 1):(offset + n_seq_bytes)], seq)
         offset += n_seq_bytes
-        qual_mem = mem[(offset + 1):(offset + l_seq)]
-        qual = qual_view(src)
-        if is_missing(qual)
+        qual = quality_scores(src)
+        if qual === nothing
             # Missing quality is encoded as all 0xff in BAM
-            fill!(qual_mem, 0xff)
+            fill!(mem[(offset + 1):(offset + l_seq)], 0xff)
         else
-            # Invariant: QUAL has the same length as SEQ, and its bytes are >= 33.
-            for i in eachindex(qual_mem, qual)
-                @inbounds qual_mem[i] = qual[i] - UInt8(33)
-            end
+            # Invariant: QUAL has the same length as SEQ
+            copyto!(mem, offset + 1, qual, 1, l_seq)
         end
     end
 
@@ -1360,15 +1446,14 @@ function try_copy_kind!(dst::SAMRecord, src::BAMRecord)::Union{SAMRecord, XAMErr
 
     # QUAL
     dst.qual_offset = length(data) % UInt32
-    qual = quality_scores(src)
+    qual = quality_string(src)
     if qual === nothing
         push!(data, UInt8('*'))
     else
+        # `append!` would push each byte
         old_len = length(data)
-        resize!(data, old_len + length(qual))
-        for (i, byte) in enumerate(qual)
-            data[old_len + i] = byte + UInt8(33)
-        end
+        resize!(data, old_len + ncodeunits(qual))
+        copyto!(data, old_len + 1, codeunits(qual), 1, ncodeunits(qual))
     end
 
     # Auxiliary fields

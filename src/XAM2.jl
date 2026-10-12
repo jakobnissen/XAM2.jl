@@ -48,7 +48,12 @@ export BAMRecord,
     reference_name,
     reference_length,
     next_reference_name,
+    reference_index,
+    next_reference_index,
     left_position,
+    next_position,
+    mapping_quality,
+    template_length,
     sequence,
     quality_string,
     quality_scores,
@@ -62,10 +67,15 @@ export BAMRecord,
     XAMErrors
 
 public try_parse!,
+    try_read!,
+    cigar,
+    seek_first_record,
     try_init,
     try_copy!,
+    QualityView,
     try_write,
     Reference,
+    reference,
     try_parse_header,
     HasEq
 
@@ -533,6 +543,7 @@ include("stringvec.jl")
 include("header.jl")
 include("references.jl")
 include("bamseq.jl")
+include("qualityview.jl")
 include("sam.jl")
 include("bam.jl")
 
@@ -604,12 +615,39 @@ if the record is not mapped.
 function reference_length end
 
 """
-    left_position(record::XAMAuxData)::Union{Nothing, Int}
+    left_position(record::XAMRecord)::Union{Nothing, Int}
 
 Return the 1-based leftmost (i.e. 5' of the reference) mapped position
 of `record`, or `nothing` if the data is not available.
 """
 function left_position end
+
+"""
+    next_position(record::XAMRecord)::Union{Nothing, Int}
+
+Return the 1-based leftmost position of the next segment in the template (PNEXT)
+of `record`, or `nothing` if the data is not available.
+
+See also: [`next_reference_name`](@ref), [`left_position`](@ref)
+"""
+function next_position end
+
+"""
+    mapping_quality(record::XAMRecord)::Union{Nothing, Int}
+
+Return the mapping quality (MAPQ) of `record`, in `0:254`, or `nothing` if it is
+not available (stored as 255).
+"""
+function mapping_quality end
+
+"""
+    template_length(record::XAMRecord)::Union{Nothing, Int}
+
+Return the observed template length (TLEN) of `record`, or `nothing` if it is
+not available (stored as 0). It is positive for the leftmost segment of the template,
+and negative for the rightmost.
+"""
+function template_length end
 
 """
     cigar(record::SAMRecord)::Union{Nothing, CIGAR, CIGARError, XAMError}
