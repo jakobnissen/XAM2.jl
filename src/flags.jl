@@ -67,7 +67,7 @@ true
 julia> SAMFlag.PAIRED in flags
 true
 
-julia> length(intersect(flags), SAMFlags([SAMFlag.UNMAP]))
+julia> length(intersect(flags, SAMFlags([SAMFlag.UNMAP])))
 1
 ```
 """

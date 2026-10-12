@@ -200,6 +200,11 @@ end
             @test next_reference_name(record) == "chr1"
             @test left_position(record) == 10
             @test quality_scores(record) === nothing
+
+            # Undefined flag bits are cleared
+            record = read_first(dir, raw_record(flag = 0xffff))
+            @test flags(record) == SAMFlags(0xffff)
+            @test Integer(flags(record)) == 0x0fff
         end
 
         @testset "Structural errors" begin
@@ -352,6 +357,12 @@ end
             record = read_first(dir, raw_record(; fields..., aux = cg_tag))
             @test String(MemoryView(CIGAR(XAM2.cigar(record)))) == "2M1I1M"
             @test mapping_span(record) == 1:3
+
+            # Like htslib writes it, m in the placeholder `kSmN` is the reference length
+            # of the alignment, not of the reference sequence
+            alignment_placeholder = encode_cigar([(4, 'S'), (3, 'N')])
+            record = read_first(dir, raw_record(; fields..., cigar = alignment_placeholder, aux = cg_tag))
+            @test String(MemoryView(CIGAR(XAM2.cigar(record)))) == "2M1I1M"
 
             # The CIGAR in the CG tag must also match the sequence length
             bad_cigar = encode_cigar([(2, 'M'), (1, 'I'), (2, 'M')])

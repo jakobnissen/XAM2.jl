@@ -232,3 +232,4 @@ end
 include("malformed.jl")
 include("header.jl")
 include("sam.jl")
+include("convert.jl")

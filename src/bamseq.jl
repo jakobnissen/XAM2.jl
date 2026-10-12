@@ -9,8 +9,13 @@ Base.ncodeunits(x::BAMSeq) = x.len
 
 const SEQ_LUT = Tuple(b"=ACMGRSVTWYHKDBN")
 
+# Like htslib, letters that are not IUPAC codes, and `.`, are encoded as `N`.
+# Other bytes are invalid.
 const ENCODE_LUT = let
     result = fill(0xff, 128)
+    for char in ['A':'Z'; 'a':'z'; '.']
+        result[Int(char) + 1] = 0x0f
+    end
     for (i, char) in enumerate("=ACMGRSVTWYHKDBN")
         encoding = i - 1
         for c in [char, lowercase(char)]
@@ -81,5 +86,5 @@ function bamseq!(dst::MutableMemoryView{UInt8}, src::ImmutableMemoryView{UInt8})
     end
     return BAMSeq(ImmutableMemoryView(dst[1:target_len]), length(src))
     @label bad_encoding
-    throw(ArgumentError("BAM sequence can only contain =ACMGRSVTWYHKDBNacmgrsvtwyhkdbn"))
+    throw(ArgumentError("BAM sequence can only contain letters, `=` and `.`"))
 end

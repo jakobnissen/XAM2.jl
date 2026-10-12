@@ -52,7 +52,8 @@ const SAM_ACTIONS = Dict{Symbol, Expr}(
     end,
     :flag => quote
         (has_overflowed | (n > typemax(UInt16))) && return sam_field_error(data, XAMErrors.invalid_flags, p)
-        record.flags = new_sam_flags(n % UInt16)
+        # Clears undefined flag bits
+        record.flags = SAMFlags(n % UInt16)
         n = zero(UInt64)
     end,
     :rname => :(record.rname_span = (mark % UInt32, (p - 1) % UInt32)),

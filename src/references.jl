@@ -20,6 +20,14 @@ function Base.show(io::IO, x::Reference)
     return print(io, ", ", x.length, ')')
 end
 
+const ReferenceIndex = Dict{StringView{ImmutableMemoryView{UInt8}}, Int32}
+
+# Holds a lazily built `ReferenceIndex`. It's atomic because `References`
+# may be shared between threads.
+mutable struct LazyReferenceIndex
+    @atomic index::Union{Nothing, ReferenceIndex}
+end
+
 """
     References <: AbstractVector{Reference}
 
@@ -47,14 +55,6 @@ julia> refs[1].length
 1000
 ```
 """
-const ReferenceIndex = Dict{StringView{ImmutableMemoryView{UInt8}}, Int32}
-
-# Holds a lazily built `ReferenceIndex`. It's atomic because `References`
-# may be shared between threads.
-mutable struct LazyReferenceIndex
-    @atomic index::Union{Nothing, ReferenceIndex}
-end
-
 struct References <: AbstractVector{Reference}
     names::StringVec
     lengths::Vector{Int32}

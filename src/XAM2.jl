@@ -63,6 +63,7 @@ export BAMRecord,
 
 public try_parse!,
     try_init,
+    try_copy!,
     try_write,
     Reference,
     try_parse_header,
@@ -122,7 +123,7 @@ module XAMErrors
         reference_length_mismatch # same reference name, but different lengths
         # Record structure
         invalid_block_length
-        record_too_long # BAM record's block size does not fit in 32 bits
+        record_too_long # BAM record's block size, or a CIGAR placeholder length, does not fit
         missing_fields # SAM line has fewer than 11 fields
         line_too_long # more than 4 GiB line
         qual_no_seq # SAM record has a quality, but no sequence
@@ -199,7 +200,6 @@ end
 
 XAMError(e::BGZFError; offset::Union{Nothing, VirtualOffset} = nothing) = XAMError(XAMErrors.bgzf_error; offset, bgzf_error = e)
 
-@noinline throw_xam_error(kind::XAMErrorKind) = throw(XAMError(kind))
 
 function error_message(kind::XAMErrorKind)::String
     E = XAMErrors
@@ -261,7 +261,7 @@ function error_message(kind::XAMErrorKind)::String
     elseif kind == E.invalid_block_length
         "BAM record's block size is too small to contain its fields"
     elseif kind == E.record_too_long
-        "BAM record is longer than 4294967295 bytes"
+        "record is too long to be represented in BAM"
     elseif kind == E.missing_fields
         "SAM record has fewer than 11 tab-separated fields"
     elseif kind == E.line_too_long
@@ -407,39 +407,27 @@ function inbounds_write_base10!(mem::MutableMemoryView{UInt8}, n::Unsigned)::Int
     return n_digits
 end
 
-function reg2bin(span::UnitRange{Int32})::UInt16
-    # TODO: remove these checks, also the one at the bottom
-    (start, stop) = (first(span), last(span))
-    @assert start in Int32(0):Int32(2^29 - 1)
-    @assert stop in (start):(Int32(2^29 - 1))
-
-    # If start is zero, the read is unmapped, and so the range
-    # must be 0:0 exactly
-    @assert !iszero(start) || iszero(stop)
-
-    # Convert start to an offset to make it zero-indexed.
-    # Note that this will be -1 when span is 0:0.
-    # Then this will use arithmetic shift right.
-    start -= one(start)
-    stop -= one(stop)
-
-    result = if start >> 14 == stop >> 14
-        div((1 << 15) - 1, 7) + (start >> 14)
-    elseif start >> 17 == stop >> 17
-        div((1 << 12) - 1, 7) + (start >> 17)
-    elseif start >> 20 == stop >> 20
-        div((1 << 9) - 1, 7) + (start >> 20)
-    elseif start >> 23 == stop >> 23
-        div((1 << 6) - 1, 7) + (start >> 23)
-    elseif start >> 26 == stop >> 26
-        div((1 << 3) - 1, 7) + (start >> 26)
+# The BAI bin of the 0-based, half-open region `beg:(stop - 1)`, see the SAM specification,
+# section 5.3. The region must not be empty, i.e. `stop > beg`. Unmapped records with no
+# position, which the specification bins as `reg2bin(-1, 0)`, have bin 4680.
+# Positions beyond the range of BAI (2^29) give bins that don't fit in 16 bits,
+# which are truncated, like htslib does.
+function reg2bin(beg::T, stop::T)::UInt16 where {T <: Unsigned}
+    stop -= one(T)
+    # Truncating the terms before adding them gives the same result as truncating the sum
+    return if beg >> 14 == stop >> 14
+        (div((1 << 15) - 1, 7) % UInt16) + ((beg >> 14) % UInt16)
+    elseif beg >> 17 == stop >> 17
+        (div((1 << 12) - 1, 7) % UInt16) + ((beg >> 17) % UInt16)
+    elseif beg >> 20 == stop >> 20
+        (div((1 << 9) - 1, 7) % UInt16) + ((beg >> 20) % UInt16)
+    elseif beg >> 23 == stop >> 23
+        (div((1 << 6) - 1, 7) % UInt16) + ((beg >> 23) % UInt16)
+    elseif beg >> 26 == stop >> 26
+        (div((1 << 3) - 1, 7) % UInt16) + ((beg >> 26) % UInt16)
     else
-        0
+        0x0000
     end
-
-    @assert result in 0:Int(typemax(UInt16))
-
-    return result % UInt16
 end
 
 function reg2bins!(bins::Vector{UInt16}, span::UnitRange{Int32})

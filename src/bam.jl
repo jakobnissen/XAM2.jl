@@ -107,7 +107,7 @@ block_size(record::BAMRecord) = (length(record.data) + BAM_FIXED_BYTES) % UInt32
 # Short form: Mapped, read name, strand
 function Base.show(io::IO, record::BAMRecord)
     mapped = is_mapped(record) ? "Mapped" : "Unmapped"
-    segment = is_first(record) ? "First" : (is_last(record) ? "Last" : "Md")
+    segment = is_first(record) ? "First" : (is_last(record) ? "Last" : "Middle")
     qname = query_name(record)
     qn = if qname === nothing
         ""
@@ -405,6 +405,10 @@ function parse_bam_header!(
         memview isa XAMError && return memview
 
         @inbounds(memview[l_name]) == 0x00 || return XAMError(XAMErrors.invalid_reference)
+        # The offsets of `StringVec` are `UInt32`
+        if length(stringvec.data) + l_name - 1 > typemax(UInt32)
+            return XAMError(XAMErrors.invalid_reference)
+        end
         push_codeunits!(stringvec, @inbounds memview[1:(l_name - 1)])
 
         l_ref = unsafe_load_integer_le(Int32, memview, l_name + 1)
@@ -575,20 +579,18 @@ seq_offset(record::BAMRecord) = cigar_offset(record) + 4 * (record.n_cigar_op % 
 qual_offset(record::BAMRecord) = seq_offset(record) + cld(record.l_seq % Int, 2)
 aux_offset(record::BAMRecord) = qual_offset(record) + record.l_seq % Int
 
-function first_eq_seq_pos(record::BAMRecord)
-    iszero(record.l_seq) && return nothing
-    n_seq_whole_bytes = (record.l_seq >> 1) % Int
-    offset = seq_offset(record)
-    has_half_byte = isodd(record.l_seq)
-    span = (offset + 1):(offset + n_seq_whole_bytes + has_half_byte)
+# The 1-based position of the first `=` in the sequence, or `nothing` if there is none
+function first_eq_seq_pos(record::BAMRecord)::Union{Nothing, Int}
+    l_seq = record.l_seq % Int
+    span = (seq_offset(record) + 1):qual_offset(record)
     mem = @inbounds ImmutableMemoryView(record.data)[span]
-    if has_half_byte
-        (last_byte, mem) = @inbounds split_last(mem)
-        iszero(last_byte & 0xf0) && return record.l_seq % Int
-    end
+    # Each byte holds two bases, the first in the high nibble. `=` is encoded as 0.
+    # If the length is odd, the low nibble of the last byte is padding.
+    n_whole_bytes = l_seq >> 1
+    # Fast path: Skip chunks of bytes with no `=`
     i = 1
     chunk_size = 128
-    @inbounds while i <= length(mem) - chunk_size + 1
+    @inbounds while i <= n_whole_bytes - chunk_size + 1
         any = false
         for j in i:(i + chunk_size - 1)
             any |= iszero(mem[j] & 0x0f) | iszero(mem[j] & 0xf0)
@@ -596,9 +598,14 @@ function first_eq_seq_pos(record::BAMRecord)
         any && break
         i += chunk_size
     end
-    @inbounds while i <= length(mem)
-        (iszero(mem[i] & 0x0f) | iszero(mem[i] & 0xf0)) && return i
+    @inbounds while i <= n_whole_bytes
+        byte = mem[i]
+        iszero(byte & 0xf0) && return 2 * i - 1
+        iszero(byte & 0x0f) && return 2 * i
         i += 1
+    end
+    if isodd(l_seq) && iszero(@inbounds(mem[end]) & 0xf0)
+        return l_seq
     end
     return nothing
 end
@@ -697,18 +704,15 @@ end
 
 # CIGARs with more than 65535 operations are stored in the CG auxiliary tag,
 # with a placeholder CIGAR `kSmN`, where k is the sequence length, and m the
-# reference length.
+# reference length of the alignment.
 @inline function is_placeholder_cigar(record::BAMRecord, cigar_encoding::ImmutableMemoryView{UInt8})
     length(cigar_encoding) == 8 || return false
     record.refID < 0 && return false
     u1 = unsafe_load_integer_le(UInt32, cigar_encoding, 1)
     u2 = unsafe_load_integer_le(UInt32, cigar_encoding, 5)
-    return if ((u1 & 0x0f) != 0x04) | ((u2 & 0x0f) != 0x03)
-        false
-    else
-        ref_length = @inbounds record.refs.lengths[record.refID + 1]
-        ((u1 >> 4) == record.l_seq) & ((u2 >> 4) == ref_length)
-    end
+    # Like htslib, don't check m, which is the reference length of the alignment,
+    # and so is only known after loading the CIGAR.
+    return ((u1 & 0x0f) == 0x04) & ((u2 & 0x0f) == 0x03) & ((u1 >> 4) == record.l_seq)
 end
 
 function get_cigar_encoding(x::BAMRecord)::Union{Nothing, ImmutableMemoryView{UInt8}}
@@ -779,6 +783,8 @@ function try_read!(x::BAMReader)::Union{BAMRecord, Nothing, XAMError}
     memview isa ImmutableMemoryView || return fail_read!(x, fill_error(memview, offset))
     stored_block_size = unsafe_load_integer_le(UInt32, memview, 1)
     unsafe_load_fixed_fields(record, @inbounds memview[5:end])
+    # Clear undefined flag bits, which `SAMFlags` must not have
+    record.flags = SAMFlags(Integer(record.flags))
     err = check_fixed_fields(record, stored_block_size)
     err === nothing || return fail_read!(x, XAMError(err; offset))
 
@@ -1060,161 +1066,157 @@ end
     return nothing
 end
 
-function store_dummy_bamcigar!(mem::MutableMemoryView{UInt8}, l_seq::UInt32, l_ref::UInt32)
-    max(l_seq, l_ref) > 0x0fff_ffff && error() # TODO
-    length(mem) == 8 || error() # TODO
-    GC.@preserve mem begin
-        ptr = Ptr{UInt32}(pointer(mem))
-        unsafe_store!(ptr, htol((l_seq << 4 | 0x04)))
-        unsafe_store!(ptr + 4, htol((l_ref << 4 | 0x03)))
-    end
-    return nothing
-end
-
-function get_index_of_refname(record::BAMRecord, name::Union{AbstractString, Nothing})
+# The ID of the reference named `name` in `refs`, or -1 if `name` is `nothing`,
+# i.e. the record has no reference.
+function sam_reference_id(refs::References, name::Union{Nothing, AbstractString})::Union{Int32, XAMErrorKind}
     name === nothing && return Int32(-1)
-    id = reference_id(record.refs, name)
-    # TODO: Return an error value instead
-    id === nothing && throw_xam_error(XAMErrors.unknown_reference)
-    return id
+    return @something reference_id(refs, name) XAMErrors.unknown_reference
 end
 
-function Base.copy!(dst::BAMRecord, src::SAMRecord)
-    # Copy over basic fields
-    dst.pos = (src.pos - 1) % Int32
-    dst.next_pos = (src.pnext - 1) % Int32
+"""
+    XAM2.try_copy!(dst::BAMRecord, src::SAMRecord)::Union{BAMRecord, XAMError}
+    XAM2.try_copy!(dst::SAMRecord, src::BAMRecord)::Union{SAMRecord, XAMError}
+
+Convert `src` to the format of `dst`, overwriting `dst`, and return `dst`.
+`copy!(dst, src)` does the same, but throws the error.
+
+If `src` can't be converted, `dst` is reset to an empty record, and an `XAMError`
+is returned. This happens if:
+* The CIGAR is malformed, or doesn't match the sequence length, see [`cigar`](@ref).
+* The auxiliary data is malformed or contains invalid values.
+* The result is too long, e.g. a BAM record longer than 4 GiB.
+* When converting to BAM, the reference or next reference of `src` is not present
+  in the references of `dst` (`XAMErrors.unknown_reference`).
+
+When converting to BAM, CIGARs with more than 65535 operations are stored in the
+`CG` auxiliary tag, replacing any existing `CG` tag. When converting from BAM, a `CG` tag
+holding the CIGAR is removed. Like htslib, sequence characters that can't be represented
+in BAM, such as `.`, are converted to `N`.
+"""
+function try_copy! end
+
+function try_copy!(dst::BAMRecord, src::SAMRecord)::Union{BAMRecord, XAMError}
+    result = try_copy_kind!(dst, src)
+    result isa BAMRecord && return result
+    # `dst` may be partially overwritten, breaking its invariants
+    reset!(dst)
+    return result isa XAMErrorKind ? XAMError(result) : result
+end
+
+function try_copy_kind!(dst::BAMRecord, src::SAMRecord)::Union{BAMRecord, XAMError, XAMErrorKind}
+    # Check what can fail before modifying `dst`
+    ref_id = sam_reference_id(dst.refs, reference_name(src))
+    ref_id isa XAMErrorKind && return ref_id
+    next_ref_id = sam_reference_id(dst.refs, next_reference_name(src))
+    next_ref_id isa XAMErrorKind && return next_ref_id
+    cig = cigar(src)
+    cig isa CIGARError && return XAMErrors.invalid_cigar
+    cig isa XAMError && return cig
+    src_aux = aux_data(src)
+    # Copying invalid auxiliary data throws
+    isvalid(src_aux) || return XAMErrors.invalid_aux_data
+
+    seq = seq_view(src)
+    l_seq = is_missing(seq) ? 0 : length(seq)
+    ref_len = cig === nothing ? 0 : CIGARStrings.ref_length(cig)
+    # CIGARs with more than 65535 operations are stored in the CG tag. The CIGAR field
+    # holds the placeholder `kSmN`, where k is the sequence length, and m the reference
+    # length of the alignment, like htslib does. Each must fit in 28 bits.
+    cigar_in_aux = cig !== nothing && length(cig) > typemax(UInt16)
+    if cigar_in_aux && max(l_seq, ref_len) > 0x0fff_ffff
+        return XAMErrors.record_too_long
+    end
+    n_cigar_op = if cig === nothing
+        0
+    elseif cigar_in_aux
+        2
+    else
+        length(cig)
+    end
+
+    # Fixed-length fields. Positions are 0 if missing in SAM, -1 in BAM.
+    dst.refID = ref_id
+    dst.next_refID = next_ref_id
+    dst.pos = (src.pos - 0x01) % Int32
+    dst.next_pos = (src.pnext - 0x01) % Int32
     dst.mapq = src.mapq
     dst.flags = src.flags
     dst.tlen = src.tlen
-
-    # Reference IDs
-    dst.refID = get_index_of_refname(dst, reference_name(src))
-    dst.next_refID = get_index_of_refname(dst, next_reference_name(src))
-
-    # Mapping span and bin
-    dst.bin = let
-        ms = mapping_span(src)
-        if !isa(ms, UnitRange{Int})
-            UInt16(4680)
-        else
-            span = (first(ms) % Int32):(last(ms) % Int32)
-            reg2bin(span)
-        end
-    end
-
-    # Set dst.n_cigar_op, handling if there is more than typemax(UInt16) ops,
-    # in which case specs say to store a particularly dummy value of 2 ops,
-    # then store it in the aux. Here, we simply store if the cigar is too big,
-    # and dst.n_cigar_op
-    cig = cigar(src)
-    cigar_too_big = false
-    dst.n_cigar_op = if cig === nothing
-        0
-    elseif cig isa CIGARError
-        throw_xam_error(XAMErrors.invalid_cigar)
-    elseif cig isa XAMError
-        throw(cig)
+    dst.n_cigar_op = n_cigar_op % UInt16
+    dst.l_seq = l_seq % UInt32
+    # Like htslib, records with no CIGAR, or one spanning no reference positions,
+    # are binned as spanning one position. Unmapped records with no position get bin 4680.
+    dst.bin = if dst.pos < 0
+        UInt16(4680)
     else
-        cigar_too_big = length(cig) > typemax(UInt16)
-        # If CIGAR is to big, we store this dummy value and store the real cigar in an AUX tag
-        cigar_too_big ? UInt16(2) : length(cig) % UInt16
+        # As `UInt64`, since the end may not fit in 32 bits
+        beg = dst.pos % UInt64
+        reg2bin(beg, beg + (max(ref_len, 1) % UInt64))
     end
+    # The CIGAR is not cached, because it would alias `data`, which is resized below
+    dst.cigar = Uninit()
 
-    # Sequence length
-    seq = sequence(src)
-    dst.l_seq = seq === nothing ? 0 : length(seq) % UInt32
+    # Variable-length fields, except auxiliary data
+    l_read_name = (src.qname_len % Int) + 1
+    n_seq_bytes = cld(l_seq, 2)
+    data = resize!(dst.data, l_read_name + 4 * n_cigar_op + n_seq_bytes + l_seq)
+    mem = MemoryView(data)
 
-    # Resize dst's vector to hold all variable-length fields, except auxdata, which we add later
-    v_len = src.qname_len + 1 + 4 * dst.n_cigar_op + ((dst.l_seq + 1) >>> 1) + dst.l_seq
-    resize!(dst.data, v_len)
-    mem = MemoryView(dst.data)
+    # Read name. A missing name is `*` in both SAM and BAM.
+    copyto!(mem, @inbounds ImmutableMemoryView(src.data)[1:(src.qname_len % Int)])
+    mem[l_read_name] = 0x00
+    dst.l_read_name = l_read_name % UInt8
+    offset = l_read_name
 
-    # Copy over qname + trailing zero byte
-    qname = query_name(src)
-    if qname === nothing
-        mem[1] = UInt8('*')
-        mem[2] = 0x00
-        dst.l_read_name = 0x02
-    else
-        cu = codeunits(qname)
-        copyto!(mem, cu)
-        mem[length(cu) + 1] = 0x00
-        dst.l_read_name = UInt8(length(cu) + 1)
+    # CIGAR
+    if cigar_in_aux
+        inbounds_store_le!(mem, offset + 1, ((l_seq % UInt32) << 4) | 0x04) # S
+        inbounds_store_le!(mem, offset + 5, ((ref_len % UInt32) << 4) | 0x03) # N
+    elseif cig !== nothing
+        CIGARStrings.encode!(mem[(offset + 1):(offset + 4 * n_cigar_op)], BAMCIGAR, cig)
     end
-    offset = dst.l_read_name
+    offset += 4 * n_cigar_op
 
-    # Copy over cigar, either the dummy value if it's too big, or else the actuial cihar
-    if cig isa CIGAR
-        if cigar_too_big
-            # If c isa CIGAR, the record must be mapped, and so refID cannot be negative.
-            reflen = dst.refs.lengths[dst.refID + 1]
-            store_dummy_bamcigar!(mem[(offset + 1):(offset + 8)], dst.l_seq, reflen % UInt32)
-            dst.cigar = Uninit()
-            offset += 8
+    # Sequence and quality
+    if l_seq > 0
+        bamseq!(mem[(offset + 1):(offset + n_seq_bytes)], seq)
+        offset += n_seq_bytes
+        qual_mem = mem[(offset + 1):(offset + l_seq)]
+        qual = qual_view(src)
+        if is_missing(qual)
+            # Missing quality is encoded as all 0xff in BAM
+            fill!(qual_mem, 0xff)
         else
-            dst_mem = mem[(offset + 1):(offset + 4 * dst.n_cigar_op)]
-            dst.cigar = CIGARStrings.encode!(dst_mem, BAMCIGAR, cig)
-            offset += 4 * dst.n_cigar_op
-        end
-    end
-
-    # Copy over sequence
-    if seq !== nothing
-        bamseq!(mem[(offset + 1):end], codeunits(seq))
-        offset += (dst.l_seq + 1) >>> 1
-    end
-
-    # Copy over quality
-    qual = quality_scores(src)
-    if qual !== nothing
-        seq === nothing && error() # TODO
-        v = mem[(offset + 1):end]
-        cu = codeunits(qual)
-        for i in eachindex(cu, v)
-            v[i] = cu[i] - UInt8(33)
-        end
-    end
-
-    # Copy over aux, if any
-    if src.aux_offset < length(src.data)
-        dst_aux = XAMAuxData.BAM.Auxiliary(dst.data, length(dst.data) + 1)
-        copy!(dst_aux, aux_data(src))
-    end
-
-    # If cigar was too big, we copy over its binary encoding to the AUX directly here.
-    if cigar_too_big
-        cig isa CIGAR || throw(AssertionError())
-        aux = aux_data(dst)
-        if haskey(aux, AuxTag("CG"))
-            error() # TODO
-        end
-
-        # Manually write the cigar in, without allocating an array
-        cigar_len = 4 * length(cig) + 6
-        oldlen = length(dst.data)
-        resize!(dst.data, oldlen + cigar_len)
-        mem = MemoryView(dst.data)[(oldlen + 1):end]
-        mem[1] = UInt8('B')
-        mem[2] = UInt8('i')
-        GC.@preserve mem begin
-            ptr = Ptr{UInt32}(pointer(mem)) + 2
-            unsafe_store!(ptr, UInt32(cigar_len))
-            for element in c
-                u = reinterpret(UInt8, element.op) % UInt32
-                u |= (element.len % UInt32) << 4
-                ptr += 4
-                unsafe_store!(ptr, u)
+            # Invariant: QUAL has the same length as SEQ, and its bytes are >= 33.
+            for i in eachindex(qual_mem, qual)
+                @inbounds qual_mem[i] = qual[i] - UInt8(33)
             end
         end
     end
 
-    # Maintain the invariant that the block size fits in a UInt32
-    if length(dst.data) > typemax(UInt32) - BAM_FIXED_BYTES
-        reset!(dst)
-        throw_xam_error(XAMErrors.record_too_long)
+    # Auxiliary data
+    dst_aux = XAMAuxData.BAM.Auxiliary(data, length(data) + 1)
+    copy!(dst_aux, src_aux)
+    if cigar_in_aux
+        delete!(dst_aux, "CG")
+        # CG:B:I array of the CIGAR's BAM encoding
+        old_len = length(data)
+        resize!(data, old_len + 8 + 4 * length(cig))
+        mem = MemoryView(data)[(old_len + 1):end]
+        copyto!(mem, b"CGBI")
+        inbounds_store_le!(mem, 5, length(cig) % UInt32)
+        CIGARStrings.encode!(mem[9:end], BAMCIGAR, cig)
     end
 
+    # Maintain the invariant that the block size fits in a UInt32
+    length(data) > typemax(UInt32) - BAM_FIXED_BYTES && return XAMErrors.record_too_long
     return dst
+end
+
+function Base.copy!(dst::BAMRecord, src::SAMRecord)
+    result = try_copy!(dst, src)
+    result isa XAMError && throw(result)
+    return result
 end
 
 function append_number_field!(
@@ -1263,11 +1265,37 @@ function append_optional_string_field!(data::Vector{UInt8}, field::Union{Nothing
     return cu + 1
 end
 
+function try_copy!(dst::SAMRecord, src::BAMRecord)::Union{SAMRecord, XAMError}
+    result = try_copy_kind!(dst, src)
+    result isa SAMRecord && return result
+    # `dst` may be partially overwritten, breaking its invariants
+    reset!(dst)
+    return result isa XAMErrorKind ? XAMError(result) : result
+end
+
 function Base.copy!(dst::SAMRecord, src::BAMRecord)
-    # Throw before modifying `dst`, so it's never left in an invalid state
+    result = try_copy!(dst, src)
+    result isa XAMError && throw(result)
+    return result
+end
+
+# Check if `cig`, the CIGAR of `record`, was loaded from the CG tag (see `load_aux_cigar`),
+# as opposed to the CIGAR field.
+function is_cigar_from_aux(record::BAMRecord, cig::BAMCIGAR)::Bool
+    mem = MemoryView(cig)
+    return GC.@preserve mem record begin
+        pointer(mem) != pointer(record.data, cigar_offset(record) + 1)
+    end
+end
+
+function try_copy_kind!(dst::SAMRecord, src::BAMRecord)::Union{SAMRecord, XAMError, XAMErrorKind}
+    # Check what can fail before modifying `dst`
     cig = cigar(src)
-    cig isa CIGARError && throw_xam_error(XAMErrors.invalid_cigar)
-    cig isa XAMError && throw(cig)
+    cig isa CIGARError && return XAMErrors.invalid_cigar
+    cig isa XAMError && return cig
+    src_aux = aux_data(src)
+    # Copying invalid auxiliary data throws
+    isvalid(src_aux) || return XAMErrors.invalid_aux_data
 
     data = dst.data
     empty!(data)
@@ -1345,12 +1373,21 @@ function Base.copy!(dst::SAMRecord, src::BAMRecord)
 
     # Auxiliary fields
     dst.aux_offset = (length(data) + 1) % UInt32 # compensate for tab
-    src_aux = aux_data(src)
     if !isempty(src_aux)
         push!(data, UInt8('\t'))
         dst_aux = XAMAuxData.SAM.Auxiliary(data, length(data) + 1)
         copy!(dst_aux, src_aux)
+        # The CIGAR field holds the CIGAR, so it's not also stored in the CG tag
+        if cig isa BAMCIGAR && is_cigar_from_aux(src, cig)
+            delete!(dst_aux, "CG")
+        end
+        # If the CG tag was the only tag, remove the tab before it
+        if isempty(dst_aux)
+            pop!(data)
+        end
     end
 
+    # Invariant of `SAMRecord`
+    length(data) < typemax(UInt32) || return XAMErrors.line_too_long
     return dst
 end
