@@ -10,8 +10,7 @@ using BufferIO: BufferIO,
     consume,
     fill_buffer,
     get_buffer,
-    grow_buffer,
-    line_views
+    grow_buffer
 
 using MemoryViews:
     MemoryViews,
@@ -22,7 +21,7 @@ using MemoryViews:
     split_each
 
 using StringViews: StringView
-using BGZFLib: BGZFReader, BGZFWriter, BGZFError, BGZFErrors, virtual_position, VirtualOffset
+using BGZFLib: BGZFReader, BGZFWriter, BGZFError, is_data_error, virtual_position, VirtualOffset
 using CIGARStrings: CIGARStrings, AbstractCIGAR, BAMCIGAR, CIGAR, CIGARError, unsafe_switch_memory
 using XAMAuxData: XAMAuxData, AuxTag, try_auxtag, is_well_formed
 
@@ -148,18 +147,18 @@ module XAMErrors
         invalid_block_length
         record_too_long # BAM record's block size, or a CIGAR placeholder length, does not fit
         missing_fields # SAM line has fewer than 11 fields
-        line_too_long # more than 4 GiB line
+        line_too_long # more than 4 GiB line, or doesn't fit in the reader's buffer
         qual_no_seq # SAM record has a quality, but no sequence
         qual_seq_mismatch # SAM record's quality and sequence have different lengths
         # Record fields
         invalid_read_name # BAM: length is zero, or not null terminated. SAM: invalid QNAME
         invalid_flags # SAM FLAG
         invalid_reference_name # SAM RNAME
-        invalid_position # position is less than -1 (BAM), or invalid POS (SAM)
+        invalid_position # position is not in -1:2147483646 (BAM), or invalid POS (SAM)
         invalid_mapq # SAM MAPQ
         invalid_cigar
         invalid_next_reference_name # SAM RNEXT
-        invalid_next_position # next position is less than -1 (BAM), or invalid PNEXT (SAM)
+        invalid_next_position # next position is not in -1:2147483646 (BAM), or invalid PNEXT (SAM)
         invalid_template_length # SAM TLEN
         invalid_sequence # SAM SEQ
         invalid_quality # SAM QUAL
@@ -288,7 +287,7 @@ function error_message(kind::XAMErrorKind)::String
     elseif kind == E.missing_fields
         "SAM record has fewer than 11 tab-separated fields"
     elseif kind == E.line_too_long
-        "SAM line is longer than 4294967294 bytes"
+        "SAM line is longer than 4294967294 bytes, or than the reader's buffer can hold"
     elseif kind == E.qual_no_seq
         "SAM record has a quality (QUAL), but no sequence (SEQ)"
     elseif kind == E.qual_seq_mismatch

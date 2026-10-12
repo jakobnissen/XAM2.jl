@@ -34,7 +34,8 @@ mutable struct BAMRecord
     #    computed without overflow. The rest of `data` is auxiliary data.
     # 3. `l_read_name >= 1`, and `data[l_read_name] == 0x00`
     # 4. `refID` and `next_refID` are in `-1:(length(refs) - 1)`
-    # 5. `pos >= -1` and `next_pos >= -1`
+    # 5. `pos` and `next_pos` are in `-1:(typemax(Int32) - 1)`. The upper bound is the
+    #    largest 0-based position that SAM's 1-based POS and PNEXT can represent.
     # The content of the variable-length fields (CIGAR, quality, auxiliary data) is not
     # validated when reading, but when accessed. Accessors return malformed content
     # as an error value, and never throw.
@@ -477,18 +478,6 @@ try_fill_buffer(reader::AbstractBufReader) = catch_data_error(() -> fill_buffer(
     end
 end
 
-# Check if the error is caused by malformed BGZF data, as opposed to misuse of the reader.
-# TODO: Upstream to BGZFLib.
-function is_data_error(e::BGZFError)::Bool
-    type = e.type
-    # Other errors are from LibDeflate, i.e. malformed gzip blocks or DEFLATE payloads
-    type isa BGZFErrors.BGZFErrorType || return true
-    # Not data errors: `block_offset_out_of_bounds` is a seek to an invalid offset,
-    # `insufficient_*_space` is a misconfigured reader or writer, and
-    # `operation_on_error` is a use of a reader in an error state.
-    return type in (BGZFErrors.truncated_file, BGZFErrors.missing_bc_field, BGZFErrors.invalid_index)
-end
-
 Base.isopen(x::BAMReader) = isopen(x.reader)
 
 function BAMReader(reader::BGZFReader; copy::Bool = true)
@@ -760,7 +749,7 @@ const CIGAR_LUT = let
     u
 end
 
-# Invariant: pos >= -1 and next_pos >= -1
+# Invariant: pos and next_pos are in BAM_POSITIONS
 function left_position(record::BAMRecord)::Union{Int, Nothing}
     return record.pos < 0 ? nothing : (record.pos % Int) + 1
 end
@@ -914,6 +903,9 @@ end
 
 # Check the structural invariants of `record` that only depend on its fixed fields,
 # see the comment in the definition of `BAMRecord`.
+# Valid 0-based positions in BAM, where -1 means missing
+const BAM_POSITIONS = Int32(-1):(typemax(Int32) - Int32(1))
+
 function check_fixed_fields(record::BAMRecord, stored_block_size::UInt32)::Union{Nothing, XAMErrorKind}
     # The block size includes the fixed fields after the block size field.
     stored_block_size < BAM_FIXED_BYTES && return XAMErrors.invalid_block_length
@@ -922,8 +914,8 @@ function check_fixed_fields(record::BAMRecord, stored_block_size::UInt32)::Union
     n_refs = length(record.refs)
     is_valid_reference_id(record.refID, n_refs) || return XAMErrors.invalid_reference_id
     is_valid_reference_id(record.next_refID, n_refs) || return XAMErrors.invalid_reference_id
-    record.pos < -1 && return XAMErrors.invalid_position
-    record.next_pos < -1 && return XAMErrors.invalid_next_position
+    in(record.pos, BAM_POSITIONS) || return XAMErrors.invalid_position
+    in(record.next_pos, BAM_POSITIONS) || return XAMErrors.invalid_next_position
     # Computed as Int, so it can't overflow
     l_seq = record.l_seq % Int
     min_len = record.l_read_name % Int + 4 * (record.n_cigar_op % Int) + cld(l_seq, 2) + l_seq
@@ -1402,7 +1394,7 @@ function try_copy_kind!(dst::SAMRecord, src::BAMRecord)::Union{SAMRecord, XAMErr
     # The length includes the tab
     dst.rname_span = (rname_start, (rname_start + rname_len_p1 - 2) % UInt32)
 
-    # POS
+    # POS. Invariant: src.pos is in BAM_POSITIONS, so this fits in SAM's POS
     dst.pos = src.pos + UInt32(1)
     append_number_field!(data, dst.pos, 10)
 
@@ -1432,7 +1424,7 @@ function try_copy_kind!(dst::SAMRecord, src::BAMRecord)::Union{SAMRecord, XAMErr
         dst.rnext_span = (rnext_start, (rnext_start + rnext_name_len_p1 - 2) % UInt32)
     end
 
-    # PNEXT
+    # PNEXT. Invariant: src.next_pos is in BAM_POSITIONS, so this fits in SAM's PNEXT
     dst.pnext = src.next_pos + UInt32(1)
     append_number_field!(data, dst.pnext, 10)
 

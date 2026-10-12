@@ -229,9 +229,17 @@ end
                     # Positions
                     (; pos = Int32(-2)) => XAMErrors.invalid_position,
                     (; next_pos = typemin(Int32)) => XAMErrors.invalid_next_position,
+                    # SAM can't represent the 1-based position 2^31
+                    (; pos = typemax(Int32)) => XAMErrors.invalid_position,
+                    (; next_pos = typemax(Int32)) => XAMErrors.invalid_next_position,
                 ]
                 @test read_first(dir, raw_record(; kwargs...)) == XAMError(err; offset = first_offset)
             end
+
+            # The largest valid position, which fits in SAM
+            record = read_first(dir, raw_record(refID = Int32(0), pos = typemax(Int32) - Int32(1)))
+            @test left_position(record) == typemax(Int32)
+            @test left_position(XAM2.try_copy!(SAMRecord(), record)) == typemax(Int32)
 
             # Truncated in fixed fields, and in variable-length fields
             @test read_first(dir, raw_record()[1:20]) == XAMError(XAMErrors.truncated_file; offset = first_offset)
