@@ -639,8 +639,8 @@ end
 
 """
     XAM2.try_init(::Type{SAMReader}, io::Union{IO, AbstractBufReader}; copy::Bool = true)::Union{SAMReader, XAMError}
-    XAM2.try_init(::Type{BAMReader}, io::Union{IO, AbstractBufReader}; copy::Bool = true, n_workers::Int = Threads.nthreads())::Union{BAMReader, XAMError}
-    XAM2.try_init(::Type{BAMReader}, bgzf::BGZFReader; copy::Bool = true)::Union{BAMReader, XAMError}
+    XAM2.try_init(::Type{BAMReader}, io::Union{IO, AbstractBufReader}; copy::Bool = true, n_workers::Int = Threads.nthreads(), strict_header::Bool = false)::Union{BAMReader, XAMError}
+    XAM2.try_init(::Type{BAMReader}, bgzf::BGZFReader; copy::Bool = true, strict_header::Bool = false)::Union{BAMReader, XAMError}
 
 Construct a reader like its constructor does, but return an `XAMError` instead of
 throwing if the header is malformed.

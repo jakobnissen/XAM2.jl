@@ -155,6 +155,18 @@ end
             @test get_header(reader) isa XAMError
             close(reader)
 
+            # ... unless `strict_header` is set
+            io = open(malformed_bam(dir; text = "@XX"))
+            @test XAM2.try_init(BAMReader, io; n_workers = 1, strict_header = true) isa XAMError
+            @test !isopen(io)
+            io = open(malformed_bam(dir; text = "@SQ\tSN:chr1\tLN:1000\n"))
+            @test XAM2.try_init(BAMReader, io; n_workers = 1, strict_header = true) ==
+                XAMError(XAMErrors.header_reference_mismatch)
+            @test_throws XAMError BAMReader(open(malformed_bam(dir; text = "@XX")); n_workers = 1, strict_header = true)
+            reader = BAMReader(open(malformed_bam(dir; text = sq_lines)); n_workers = 1, strict_header = true)
+            @test get_header(reader) isa SAMHeader
+            close(reader)
+
             # On failure, the error is returned, and the input is closed
             io = open(malformed_bam(dir; refs = [("a", 1), ("a", 2)]))
             @test XAM2.try_init(BAMReader, io; n_workers = 1) == XAMError(XAMErrors.duplicate_reference)

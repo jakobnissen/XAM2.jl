@@ -77,6 +77,7 @@ public try_parse!,
     Reference,
     reference,
     try_parse_header,
+    try_validate,
     HasEq,
     AbstractHeader,
     HeaderHD,
@@ -725,6 +726,7 @@ For a `BAMReader`, the reference sequences are read from the binary part of the
 header (see [`references`](@ref)), so the text header is not needed to read records.
 If the text header is malformed, or its `@SQ` lines do not match the binary references,
 this returns an `XAMError`, and the records can still be read.
+This can not happen if the reader was constructed with `strict_header = true`.
 """
 function get_header end
 

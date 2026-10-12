@@ -173,19 +173,43 @@ function unwrap_references(x::Union{References, XAMErrorKind})::References
     throw(ArgumentError(msg))
 end
 
-# Check if the @SQ lines of the header, if any, agree with `refs`.
-function header_matches_references(header::SAMHeader, refs::References)::Bool
+"""
+    try_validate(header::SAMHeader, refs::References)::Union{Nothing, XAMError}
+
+Check that the `@SQ` lines of `header`, if any, agree with `refs`, i.e. that they have the
+same names and lengths, in the same order. Return `nothing` if they agree, else an
+`XAMError` of kind `XAMErrors.header_reference_mismatch`.
+A header without `@SQ` lines agrees with any references.
+
+The header itself needs no validation, since a `SAMHeader` is validated when parsed.
+
+This check is done by [`BAMReader`](@ref) when reading the header, and by
+[`BAMWriter`](@ref), which throws an `ArgumentError` if it fails.
+
+# Examples
+```jldoctest
+julia> header = XAM2.try_parse_header(ImmutableMemoryView("@SQ\\tSN:chr1\\tLN:100\\n"));
+
+julia> XAM2.try_validate(header, References(["chr1"], [100])) === nothing
+true
+
+julia> XAM2.try_validate(header, References(["chr1"], [101])) isa XAMError
+true
+```
+"""
+function try_validate(header::SAMHeader, refs::References)::Union{Nothing, XAMError}
     seqs = header.seqs
-    isempty(seqs) && return true
-    length(seqs) == length(refs) || return false
+    isempty(seqs) && return nothing
+    err = XAMError(XAMErrors.header_reference_mismatch)
+    length(seqs) == length(refs) || return err
     for (sq, ref) in zip(seqs, refs)
-        (sq.sn == ref.name && sq.ln == ref.length) || return false
+        (sq.sn == ref.name && sq.ln == ref.length) || return err
     end
-    return true
+    return nothing
 end
 
 function check_header_references(header::SAMHeader, refs::References)::Nothing
-    if !header_matches_references(header, refs)
+    if try_validate(header, refs) !== nothing
         throw(ArgumentError("@SQ lines in header do not match the references"))
     end
     return nothing

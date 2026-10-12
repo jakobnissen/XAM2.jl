@@ -76,6 +76,14 @@ summarize(r::BAMRecord) = (
     @test isempty(References(parse_header("@HD\tVN:1.6\n")))
     # Duplicate names are rejected by the header parser
     @test try_parse_header(ImmutableMemoryView("@SQ\tSN:x\tLN:10\n@SQ\tSN:x\tLN:20\n")) isa XAMError
+
+    # Validating a header against references
+    mismatch = XAMError(XAMErrors.header_reference_mismatch)
+    @test XAM2.try_validate(header, References(["x", "y"], [10, 20])) === nothing
+    @test XAM2.try_validate(parse_header("@HD\tVN:1.6\n"), References(["x"], [10])) === nothing
+    @test XAM2.try_validate(header, References(["y", "x"], [20, 10])) == mismatch
+    @test XAM2.try_validate(header, References(["x", "y"], [10, 21])) == mismatch
+    @test XAM2.try_validate(header, References(["x"], [10])) == mismatch
 end
 
 @testset "BAMReader" begin

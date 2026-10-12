@@ -213,10 +213,11 @@ sequences with [`references`](@ref).
     BAMReader(
         io::Union{IO, AbstractBufReader};
         copy::Bool = true,
-        n_workers::Int = Threads.nthreads()
+        n_workers::Int = Threads.nthreads(),
+        strict_header::Bool = false,
     )::BAMReader
 
-    BAMReader(bgzf::BGZFReader; copy::Bool=true)
+    BAMReader(bgzf::BGZFReader; copy::Bool = true, strict_header::Bool = false)
 
 Construct a `BAMReader` from `io`, by wrapping `io` in a `BGZFLib.BGZFReader`,
 reading and validating the header.
@@ -224,7 +225,11 @@ This reader takes control of `io`. Mutating `io` after the reader is constructed
 is not permitted. Closing the resulting reader will close `io`.
 If the binary header is malformed, `io` is closed and an `XAMError` is thrown.
 See [`XAM2.try_init`](@ref) for a version that returns the error instead.
-A malformed text header does not prevent reading records, see [`get_header`](@ref).
+By default, a malformed text header, or one whose `@SQ` lines disagree with the
+binary references, does not prevent reading records, see [`get_header`](@ref).
+If `strict_header` is `true`, such a header is instead an error when constructing
+the reader, so `get_header` is guaranteed to return a `SAMHeader`.
+See also [`XAM2.try_validate`](@ref).
 
 Use `seek(reader, offset::VirtualOffset)` to seek to a record, e.g. to the
 `offset` of an `XAMError` returned when reading a record. Seeking to an offset outside
@@ -254,7 +259,12 @@ mutable struct BAMReader{T <: AbstractBufReader}
     error::Union{Nothing, XAMError}
 end
 
-function try_init(::Type{BAMReader}, reader::BGZFReader{T}; copy::Bool = true)::Union{BAMReader{T}, XAMError} where {T}
+function try_init(
+        ::Type{BAMReader},
+        reader::BGZFReader{T};
+        copy::Bool = true,
+        strict_header::Bool = false,
+    )::Union{BAMReader{T}, XAMError} where {T}
     buffer = UInt8[]
     parsed = close_on_throw(() -> parse_bam_header!(reader, buffer), reader)
     if parsed isa XAMError
@@ -262,6 +272,10 @@ function try_init(::Type{BAMReader}, reader::BGZFReader{T}; copy::Bool = true)::
         return parsed
     end
     (; header, refs) = parsed
+    if strict_header && header isa XAMError
+        close(reader)
+        return header
+    end
     vo_at_first_record = virtual_position(reader)
     record = new_bam_record(refs, buffer)
     return BAMReader{T}(reader, refs, header, vo_at_first_record, copy, record, nothing)
@@ -272,10 +286,11 @@ function try_init(
         io::Union{IO, AbstractBufReader};
         copy::Bool = true,
         n_workers::Int = Threads.nthreads(),
+        strict_header::Bool = false,
     )::Union{BAMReader, XAMError}
     # The BGZFReader constructor reads from `io`, which may throw
     bgzf = close_on_throw(() -> BGZFReader(io; n_workers), io)
-    return try_init(BAMReader, bgzf; copy)
+    return try_init(BAMReader, bgzf; copy, strict_header)
 end
 
 get_header(reader::BAMReader) = reader.header
@@ -419,8 +434,8 @@ function parse_bam_header!(
     refs = try_build_references(stringvec, reflens)
     refs isa XAMErrorKind && return XAMError(refs)
     # The binary references are used for records, and the text header must not disagree
-    if header isa SAMHeader && !header_matches_references(header, refs)
-        header = XAMError(XAMErrors.header_reference_mismatch)
+    if header isa SAMHeader
+        header = @something try_validate(header, refs) header
     end
     return @NamedTuple{header::Union{SAMHeader, XAMError}, refs::References}((header, refs))
 end
@@ -480,14 +495,19 @@ end
 
 Base.isopen(x::BAMReader) = isopen(x.reader)
 
-function BAMReader(reader::BGZFReader; copy::Bool = true)
-    result = try_init(BAMReader, reader; copy)
+function BAMReader(reader::BGZFReader; copy::Bool = true, strict_header::Bool = false)
+    result = try_init(BAMReader, reader; copy, strict_header)
     result isa XAMError && throw(result)
     return result
 end
 
-function BAMReader(io::Union{IO, AbstractBufReader}; copy::Bool = true, n_workers::Int = Threads.nthreads())
-    result = try_init(BAMReader, io; copy, n_workers)
+function BAMReader(
+        io::Union{IO, AbstractBufReader};
+        copy::Bool = true,
+        n_workers::Int = Threads.nthreads(),
+        strict_header::Bool = false,
+    )
+    result = try_init(BAMReader, io; copy, n_workers, strict_header)
     result isa XAMError && throw(result)
     return result
 end
