@@ -10,86 +10,6 @@
 # The BAM reader additionally checks that the @SQ lines, if any, agree with the binary
 # reference list.
 
-module SAMHeaderErrors
-    @enum SAMHeaderErrorKind::UInt8 begin
-        invalid_line # line does not start with `@` and a two-letter record type
-        unknown_record_type
-        invalid_field # field is not `TAG:VALUE` with a valid tag and non-empty value
-        duplicate_tag
-        hd_not_first
-        no_vn_field
-        invalid_vn_field
-        invalid_sort_order
-        no_sn_field
-        invalid_sn_field
-        duplicate_sn_field
-        no_ln_field
-        invalid_ln_field
-        invalid_topology
-        no_id_field
-    end
-end
-
-using .SAMHeaderErrors: SAMHeaderErrorKind
-
-"""
-    SAMHeaderError <: Exception
-
-Exception thrown, or returned, from parsing SAM headers.
-This type is public, but its fields are currently internal.
-"""
-struct SAMHeaderError <: Exception
-    # 1-based line number in the header
-    line::Int
-    # 1-based byte column in the line where the error was detected
-    column::Int
-    kind::SAMHeaderErrorKind
-end
-
-function header_error_message(kind::SAMHeaderErrorKind)::String
-    E = SAMHeaderErrors
-    return if kind == E.invalid_line
-        "line does not start with '@' followed by a two-letter record type and a tab"
-    elseif kind == E.unknown_record_type
-        "record type is not one of HD, SQ, RG, PG or CO"
-    elseif kind == E.invalid_field
-        "field is not of the form TAG:VALUE, with a tag matching [A-Za-z][A-Za-z0-9] " *
-            "and a non-empty value"
-    elseif kind == E.duplicate_tag
-        "tag occurs more than once in the line"
-    elseif kind == E.hd_not_first
-        "@HD line is not the first line"
-    elseif kind == E.no_vn_field
-        "@HD line has no VN field"
-    elseif kind == E.invalid_vn_field
-        "VN field of @HD line is not of the form MAJOR.MINOR"
-    elseif kind == E.invalid_sort_order
-        "SO field of @HD line is not \"unknown\", \"unsorted\", \"queryname\" or \"coordinate\""
-    elseif kind == E.no_sn_field
-        "@SQ line has no SN field"
-    elseif kind == E.invalid_sn_field
-        "SN field of @SQ line is not a valid reference name"
-    elseif kind == E.duplicate_sn_field
-        "SN field of @SQ line is the same as that of a previous @SQ line"
-    elseif kind == E.no_ln_field
-        "@SQ line has no LN field"
-    elseif kind == E.invalid_ln_field
-        "LN field of @SQ line is not an integer in 1:2147483647"
-    elseif kind == E.invalid_topology
-        "TP field of @SQ line is not \"linear\" or \"circular\""
-    else
-        @assert kind == E.no_id_field
-        "@RG or @PG line has no ID field"
-    end
-end
-
-function Base.showerror(io::IO, error::SAMHeaderError)
-    return print(
-        io, "SAMHeaderError: Invalid SAM header at line ", error.line, ", column ",
-        error.column, ": ", header_error_message(error.kind),
-    )
-end
-
 @noinline function throw_property_error(x, sym)
     s = "Type $(typeof(x)) has no such property: $(sym)"
     error(s)
@@ -390,13 +310,13 @@ end
 Base.length(h::AbstractHeader) = getfield(h, :len)
 
 """
-    try_parse_header(data::ImmutableMemoryView{UInt8})::Union{SAMHeader, SAMHeaderError}
+    try_parse_header(data::ImmutableMemoryView{UInt8})::Union{SAMHeader, XAMError}
 
-Parse `data` as a SAM header, or return a `SAMHeaderError` with information about how
-the parsing failed. Lines may end with `\\n` or `\\r\\n`, and the last line need not
+Parse `data` as a SAM header, or return an `XAMError` with the kind of error, and
+the line and column where it occurred. Lines may end with `\\n` or `\\r\\n`, and the last line need not
 end with a newline. The returned header aliases `data`.
 """
-function try_parse_header(data::ImmutableMemoryView{UInt8})::Union{SAMHeader, SAMHeaderError}
+function try_parse_header(data::ImmutableMemoryView{UInt8})::Union{SAMHeader, XAMError}
     state = HeaderParseState()
     line_number = 0
     rest = data
@@ -412,7 +332,10 @@ function try_parse_header(data::ImmutableMemoryView{UInt8})::Union{SAMHeader, SA
             line = @inbounds line[1:(end - 1)]
         end
         err = parse_header_line!(state, line, line_number)
-        err === nothing || return SAMHeaderError(line_number, first(err), last(err))
+        if err !== nothing
+            (column, kind) = err
+            return XAMError(kind; line = line_number, column)
+        end
     end
     return SAMHeader(data, state.hd, state.sqs, state.cos, state.rgs, state.pgs)
 end
@@ -448,18 +371,17 @@ end
 str_as_u16(s::String) = (codeunit(s, 1) % UInt16) | ((codeunit(s, 2) % UInt16) << 8)
 
 # Errors are returned as (column, kind)
-const HeaderLineError = Tuple{Int, SAMHeaderErrorKind}
+const HeaderLineError = Tuple{Int, XAMErrorKind}
 
 function parse_header_line!(
         state::HeaderParseState,
         line::ImmutableMemoryView{UInt8},
         line_number::Int,
     )::Union{Nothing, HeaderLineError}
-    E = SAMHeaderErrors
     # The record type, and if there is content, a tab after it
     if length(line) < 3 || @inbounds(line[1]) != UInt8('@') ||
             (length(line) > 3 && @inbounds(line[4]) != UInt8('\t'))
-        return (1, E.invalid_line)
+        return (1, XAMErrors.header_invalid_line)
     end
     record_type = (@inbounds(line[2]) % UInt16) | ((@inbounds(line[3]) % UInt16) << 8)
     # Content after the record type and the tab
@@ -470,7 +392,7 @@ function parse_header_line!(
         push!(state.cos, StringView(content))
         return nothing
     elseif record_type ∉ (str_as_u16("HD"), str_as_u16("SQ"), str_as_u16("RG"), str_as_u16("PG"))
-        return (2, E.unknown_record_type)
+        return (2, XAMErrors.header_unknown_record_type)
     end
 
     err = split_header_fields!(state, line)
@@ -478,7 +400,7 @@ function parse_header_line!(
     fields = state.fields
 
     return if record_type == str_as_u16("HD")
-        line_number == 1 || return (1, E.hd_not_first)
+        line_number == 1 || return (1, XAMErrors.header_hd_not_first)
         hd = parse_hd(fields, content)
         hd isa HeaderLineError && return hd
         state.hd = hd
@@ -519,9 +441,9 @@ function split_header_fields!(
         column = tab + 1
         next_tab = something(findnext(==(UInt8('\t')), line, column), length(line) + 1)
         field = @inbounds line[column:(next_tab - 1)]
-        is_valid_field(field) || return (column, SAMHeaderErrors.invalid_field)
+        is_valid_field(field) || return (column, XAMErrors.header_invalid_field)
         tag = (@inbounds(field[1]) % UInt16) | ((@inbounds(field[2]) % UInt16) << 8)
-        @inbounds(seen[(tag % Int) + 1]) && return (column, SAMHeaderErrors.duplicate_tag)
+        @inbounds(seen[(tag % Int) + 1]) && return (column, XAMErrors.header_duplicate_tag)
         @inbounds seen[(tag % Int) + 1] = true
         push!(fields, HeaderField(tag, column, @inbounds field[4:end]))
         tab = next_tab
@@ -545,14 +467,14 @@ function parse_hd(
     for field in fields
         if field.tag == str_as_u16("VN")
             version = parse_vn_field(field.value)
-            version === nothing && return (field.column, SAMHeaderErrors.invalid_vn_field)
+            version === nothing && return (field.column, XAMErrors.header_invalid_vn)
         elseif field.tag == str_as_u16("SO")
             sort_order = @something parse_sort_order(field.value) begin
-                return (field.column, SAMHeaderErrors.invalid_sort_order)
+                return (field.column, XAMErrors.header_invalid_sort_order)
             end
         end
     end
-    version === nothing && return (1, SAMHeaderErrors.no_vn_field)
+    version === nothing && return (1, XAMErrors.header_missing_vn)
     (major, minor) = version
     return HeaderHD(content, length(fields), major, minor, sort_order)
 end
@@ -578,28 +500,28 @@ function parse_sq!(
     for field in fields
         if field.tag == str_as_u16("SN")
             is_valid_reference_name(field.value) ||
-                return (field.column, SAMHeaderErrors.invalid_sn_field)
+                return (field.column, XAMErrors.header_invalid_sn)
             sn = StringView(field.value)
             sn_column = field.column
         elseif field.tag == str_as_u16("LN")
             ln = tryparse_base10(Int32, field.value)
             # Note: This also rejects a leading '-', as that would give a negative number
-            (ln === nothing || ln < 1) && return (field.column, SAMHeaderErrors.invalid_ln_field)
+            (ln === nothing || ln < 1) && return (field.column, XAMErrors.header_invalid_ln)
         elseif field.tag == str_as_u16("TP")
             topology = if field.value == b"linear"
                 Topologies.linear
             elseif field.value == b"circular"
                 Topologies.circular
             else
-                return (field.column, SAMHeaderErrors.invalid_topology)
+                return (field.column, XAMErrors.header_invalid_topology)
             end
         end
     end
-    sn === nothing && return (1, SAMHeaderErrors.no_sn_field)
-    ln === nothing && return (1, SAMHeaderErrors.no_ln_field)
+    sn === nothing && return (1, XAMErrors.header_missing_sn)
+    ln === nothing && return (1, XAMErrors.header_missing_ln)
     n_before = length(sns)
     push!(sns, sn)
-    length(sns) == n_before && return (sn_column, SAMHeaderErrors.duplicate_sn_field)
+    length(sns) == n_before && return (sn_column, XAMErrors.header_duplicate_sn)
     return HeaderSQ(content, sn, length(fields), ln % Int, topology)
 end
 
@@ -607,7 +529,7 @@ function parse_id(fields::Vector{HeaderField})::Union{HeaderString, HeaderLineEr
     for field in fields
         field.tag == str_as_u16("ID") && return StringView(field.value)
     end
-    return (1, SAMHeaderErrors.no_id_field)
+    return (1, XAMErrors.header_missing_id)
 end
 
 # Bytes allowed in reference names, see the SAM specification, section 1.2.1:

@@ -19,11 +19,10 @@ using MemoryViews:
     MemoryView,
     MutableMemoryView,
     split_last,
-    split_each,
-    split_at
+    split_each
 
 using StringViews: StringView
-using BGZFLib: BGZFReader, BGZFWriter, virtual_position, VirtualOffset
+using BGZFLib: BGZFReader, BGZFWriter, BGZFError, BGZFErrors, virtual_position, VirtualOffset
 using CIGARStrings: CIGARStrings, AbstractCIGAR, BAMCIGAR, CIGAR, CIGARError, unsafe_switch_memory
 using XAMAuxData: XAMAuxData, AuxTag, try_auxtag, is_well_formed
 
@@ -63,11 +62,11 @@ export BAMRecord,
     XAMErrors
 
 public try_parse!,
+    try_init,
     try_write,
     Reference,
     try_parse_header,
-    HasEq,
-    SAMHeaderError
+    HasEq
 
 """
     module XAMErrors
@@ -90,36 +89,59 @@ module XAMErrors
     [...]
     """
     @enum XAMErrorKind::UInt8 begin
+        # IO
         truncated_file
-        invalid_block_length
         closed_stream
+        bgzf_error # malformed BGZF compression, see the `bgzf_error` property of `XAMError`
+        # BAM header
         header_truncated
         header_bad_magic_bytes
         header_top_bit_set
         header_reference_mismatch # @SQ lines in BAM header differ from binary references
-        invalid_cigar
-        missing_fields # SAM line has fewer than 11 fields
-        line_too_long # more than 4 GiB line
-        qual_no_seq # SAM record has a quality, but no sequence
-        qual_seq_mismatch # SAM record's quality and sequence have different lengths
+        # SAM header text, also in BAM
+        header_invalid_line # line is not `@`, a two-letter record type, and a tab
+        header_unknown_record_type
+        header_invalid_field # field is not `TAG:VALUE` with a valid tag and non-empty value
+        header_duplicate_tag # tag occurs twice in the same line
+        header_hd_not_first
+        header_missing_vn
+        header_invalid_vn
+        header_invalid_sort_order
+        header_missing_sn
+        header_invalid_sn
+        header_duplicate_sn
+        header_missing_ln
+        header_invalid_ln
+        header_invalid_topology
+        header_missing_id # in @RG or @PG line
+        # References
         invalid_reference # reference with invalid name or length
         duplicate_reference # two references with the same name
         invalid_reference_id # record has a reference ID outside the references
         unknown_reference # record's reference is not present in the destination
         reference_length_mismatch # same reference name, but different lengths
+        # Record structure
+        invalid_block_length
+        record_too_long # BAM record's block size does not fit in 32 bits
+        missing_fields # SAM line has fewer than 11 fields
+        line_too_long # more than 4 GiB line
+        qual_no_seq # SAM record has a quality, but no sequence
+        qual_seq_mismatch # SAM record's quality and sequence have different lengths
+        # Record fields
         invalid_read_name # BAM: length is zero, or not null terminated. SAM: invalid QNAME
         invalid_flags # SAM FLAG
         invalid_reference_name # SAM RNAME
         invalid_position # position is less than -1 (BAM), or invalid POS (SAM)
         invalid_mapq # SAM MAPQ
+        invalid_cigar
         invalid_next_reference_name # SAM RNEXT
         invalid_next_position # next position is less than -1 (BAM), or invalid PNEXT (SAM)
         invalid_template_length # SAM TLEN
         invalid_sequence # SAM SEQ
         invalid_quality # SAM QUAL
         invalid_aux_data # SAM auxiliary fields
+        # Record content, validated lazily
         cigar_query_length_mismatch # CIGAR's query length differs from sequence length
-        record_too_long # BAM record's block size does not fit in 32 bits
     end
 end # module XAMErrors
 
@@ -128,15 +150,54 @@ using .XAMErrors: XAMErrorKind
 """
     XAMError <: Exception
 
-An exception thrown when reading or writing invalid SAM or BAM data.
+An error from reading, parsing or writing invalid SAM or BAM data.
+Functions such as `XAM2.try_read!` return an `XAMError`, and their throwing
+counterparts, such as iteration, throw it.
 
-Instances of this error has a public `.kind` property of type
-`XAMErrorKind`. You can use this programmatically check the kind
-of exception.
+An `XAMError` has the following public properties:
+* `kind::XAMErrorKind`: What went wrong. Use this to check the kind of error
+  programmatically, see [`XAMErrors`](@ref).
+* `record::Union{Nothing, Int}`: The 1-based number of the record in the file
+  where the error occurred, counted from the first record.
+* `line::Union{Nothing, Int}`: The 1-based line number, for errors in SAM text,
+  i.e. SAM files, and the text headers of SAM and BAM files.
+* `column::Union{Nothing, Int}`: The 1-based byte column in the line.
+* `offset::Union{Nothing, VirtualOffset}`: For BAM records, the BGZF virtual offset
+  of the start of the record. Seeking a `BAMReader` to this offset and reading
+  reproduces the error.
+* `bgzf_error::Union{Nothing, BGZFLib.BGZFError}`: For errors of kind
+  `XAMErrors.bgzf_error`, the error from decompressing the malformed BGZF data.
+
+The location properties are `nothing` if not applicable or not known.
+SAM records have `record`, `line` and `column`; text headers of SAM and BAM files have
+`line` and `column`; and BAM records have `offset`.
+
+    XAMError(
+        kind::XAMErrorKind;
+        record=nothing, line=nothing, column=nothing, offset=nothing, bgzf_error=nothing,
+    )
 """
 struct XAMError <: Exception
     kind::XAMErrorKind
+    record::Union{Nothing, Int}
+    line::Union{Nothing, Int}
+    column::Union{Nothing, Int}
+    offset::Union{Nothing, VirtualOffset}
+    bgzf_error::Union{Nothing, BGZFError}
 end
+
+function XAMError(
+        kind::XAMErrorKind;
+        record::Union{Nothing, Int} = nothing,
+        line::Union{Nothing, Int} = nothing,
+        column::Union{Nothing, Int} = nothing,
+        offset::Union{Nothing, VirtualOffset} = nothing,
+        bgzf_error::Union{Nothing, BGZFError} = nothing,
+    )
+    return XAMError(kind, record, line, column, offset, bgzf_error)
+end
+
+XAMError(e::BGZFError; offset::Union{Nothing, VirtualOffset} = nothing) = XAMError(XAMErrors.bgzf_error; offset, bgzf_error = e)
 
 @noinline throw_xam_error(kind::XAMErrorKind) = throw(XAMError(kind))
 
@@ -144,10 +205,10 @@ function error_message(kind::XAMErrorKind)::String
     E = XAMErrors
     return if kind == E.truncated_file
         "input data is truncated; does not contain whole record or header"
-    elseif kind == E.invalid_block_length
-        "BAM record's block size is too small to contain its fields"
     elseif kind == E.closed_stream
         "stream is closed"
+    elseif kind == E.bgzf_error
+        "malformed BGZF compression"
     elseif kind == E.header_truncated
         "BAM header is truncated"
     elseif kind == E.header_bad_magic_bytes
@@ -156,16 +217,37 @@ function error_message(kind::XAMErrorKind)::String
         "header text length or number of references in BAM header exceeds 2147483647"
     elseif kind == E.header_reference_mismatch
         "@SQ lines in BAM header do not match the reference sequences in the binary header"
-    elseif kind == E.invalid_cigar
-        "invalid CIGAR"
-    elseif kind == E.missing_fields
-        "SAM record has fewer than 11 tab-separated fields"
-    elseif kind == E.line_too_long
-        "SAM line is longer than 4294967295 bytes"
-    elseif kind == E.qual_no_seq
-        "SAM record has a quality (QUAL), but no sequence (SEQ)"
-    elseif kind == E.qual_seq_mismatch
-        "SAM record's quality (QUAL) and sequence (SEQ) have different lengths"
+    elseif kind == E.header_invalid_line
+        "SAM header line does not start with '@' followed by a two-letter record type and a tab"
+    elseif kind == E.header_unknown_record_type
+        "SAM header record type is not one of HD, SQ, RG, PG or CO"
+    elseif kind == E.header_invalid_field
+        "SAM header field is not of the form TAG:VALUE, with a tag matching " *
+            "[A-Za-z][A-Za-z0-9] and a non-empty value"
+    elseif kind == E.header_duplicate_tag
+        "tag occurs more than once in the same SAM header line"
+    elseif kind == E.header_hd_not_first
+        "@HD line is not the first line of the SAM header"
+    elseif kind == E.header_missing_vn
+        "@HD line has no VN field"
+    elseif kind == E.header_invalid_vn
+        "VN field of @HD line is not of the form MAJOR.MINOR"
+    elseif kind == E.header_invalid_sort_order
+        "SO field of @HD line is not \"unknown\", \"unsorted\", \"queryname\" or \"coordinate\""
+    elseif kind == E.header_missing_sn
+        "@SQ line has no SN field"
+    elseif kind == E.header_invalid_sn
+        "SN field of @SQ line is not a valid reference name"
+    elseif kind == E.header_duplicate_sn
+        "SN field of @SQ line is the same as that of a previous @SQ line"
+    elseif kind == E.header_missing_ln
+        "@SQ line has no LN field"
+    elseif kind == E.header_invalid_ln
+        "LN field of @SQ line is not an integer in 1:2147483647"
+    elseif kind == E.header_invalid_topology
+        "TP field of @SQ line is not \"linear\" or \"circular\""
+    elseif kind == E.header_missing_id
+        "@RG or @PG line has no ID field"
     elseif kind == E.invalid_reference
         "reference sequence has an invalid name or length"
     elseif kind == E.duplicate_reference
@@ -176,6 +258,18 @@ function error_message(kind::XAMErrorKind)::String
         "record's reference is not present in the destination's references"
     elseif kind == E.reference_length_mismatch
         "record's reference has a different length in the destination's references"
+    elseif kind == E.invalid_block_length
+        "BAM record's block size is too small to contain its fields"
+    elseif kind == E.record_too_long
+        "BAM record is longer than 4294967295 bytes"
+    elseif kind == E.missing_fields
+        "SAM record has fewer than 11 tab-separated fields"
+    elseif kind == E.line_too_long
+        "SAM line is longer than 4294967294 bytes"
+    elseif kind == E.qual_no_seq
+        "SAM record has a quality (QUAL), but no sequence (SEQ)"
+    elseif kind == E.qual_seq_mismatch
+        "SAM record's quality (QUAL) and sequence (SEQ) have different lengths"
     elseif kind == E.invalid_read_name
         "invalid read name (QNAME)"
     elseif kind == E.invalid_flags
@@ -186,6 +280,8 @@ function error_message(kind::XAMErrorKind)::String
         "invalid position (POS)"
     elseif kind == E.invalid_mapq
         "invalid mapping quality (MAPQ)"
+    elseif kind == E.invalid_cigar
+        "invalid CIGAR"
     elseif kind == E.invalid_next_reference_name
         "invalid next reference name (RNEXT)"
     elseif kind == E.invalid_next_position
@@ -198,16 +294,31 @@ function error_message(kind::XAMErrorKind)::String
         "invalid quality (QUAL)"
     elseif kind == E.invalid_aux_data
         "invalid auxiliary data"
-    elseif kind == E.cigar_query_length_mismatch
-        "query length of CIGAR differs from the length of the sequence"
     else
-        @assert kind == E.record_too_long
-        "BAM record is longer than 4294967295 bytes"
+        @assert kind == E.cigar_query_length_mismatch
+        "query length of CIGAR differs from the length of the sequence"
     end
 end
 
 function Base.showerror(io::IO, error::XAMError)
-    return print(io, "XAMError: ", error_message(error.kind))
+    print(io, "XAMError: ", error_message(error.kind))
+    bgzf_error = error.bgzf_error
+    if bgzf_error !== nothing
+        print(io, " (")
+        showerror(io, bgzf_error)
+        print(io, ')')
+    end
+    is_first = true
+    for (name, value) in (("record", error.record), ("line", error.line), ("column", error.column))
+        value === nothing && continue
+        print(io, is_first ? " at " : ", ", name, ' ', value)
+        is_first = false
+    end
+    offset = error.offset
+    if offset !== nothing
+        print(io, is_first ? " at " : ", ", "virtual offset ", offset)
+    end
+    return nothing
 end
 
 struct Uninit end
@@ -367,7 +478,7 @@ end
 # * If old_cigar is a AbstractCIGAR, it aliases `old_vector`
 # * old_vector == new_vector
 function copy_cigar!(
-        old_cigar::Union{Nothing, Uninit, CIGARError, XAMErrorKind, AbstractCIGAR},
+        old_cigar::Union{Nothing, Uninit, CIGARError, XAMError, AbstractCIGAR},
         old_vector::Vector{UInt8},
         new_vector::Vector{UInt8},
     )
@@ -393,10 +504,10 @@ end
 
 # Return `cig`, or an error if its query length differs from the sequence length.
 # A sequence length of zero means the sequence is missing, so any CIGAR is allowed.
-function check_query_length(cig::T, seq_len::Int)::Union{T, XAMErrorKind} where {T <: AbstractCIGAR}
+function check_query_length(cig::T, seq_len::Int)::Union{T, XAMError} where {T <: AbstractCIGAR}
     # The query length is stored in the CIGAR, so this is cheap
     if !iszero(seq_len) && CIGARStrings.query_length(cig) != seq_len
-        return XAMErrors.cigar_query_length_mismatch
+        return XAMError(XAMErrors.cigar_query_length_mismatch)
     end
     return cig
 end
@@ -407,6 +518,27 @@ end
 Seek `reader` back to the first record.
 """
 function seek_first_record end
+
+# Run `f()`, closing `io` if it throws. Used when constructing readers, which take
+# ownership of `io`: If construction fails, the caller has no reader to close.
+# The exception is rethrown, not handled.
+function close_on_throw(f, io)
+    return try
+        f()
+    catch
+        close(io)
+        rethrow()
+    end
+end
+
+# Errors are sticky until the reader is seeked, except if it's closed
+function clear_error!(reader)
+    err = reader.error
+    if err !== nothing && err.kind != XAMErrors.closed_stream
+        reader.error = nothing
+    end
+    return nothing
+end
 
 include("flags.jl")
 include("stringvec.jl")
@@ -492,14 +624,15 @@ of `record`, or `nothing` if the data is not available.
 function left_position end
 
 """
-    cigar(record::SAMRecord)::Union{Nothing, CIGAR, CIGARError, XAMErrorKind}
-    cigar(record::BAMRecord)::Union{Nothing, BAMCIGAR, CIGARError, XAMErrorKind}
+    cigar(record::SAMRecord)::Union{Nothing, CIGAR, CIGARError, XAMError}
+    cigar(record::BAMRecord)::Union{Nothing, BAMCIGAR, CIGARError, XAMError}
 
 Get the `cigar` of `record` as a `CIGARStrings.CIGAR` or
 `CIGARStrings.BAMCIGAR`, or return `nothing` if the data is not available,
 or a `CIGARStrings.CIGARError` if the cigar is malformed.
 If the record has a sequence, and the query length of the cigar differs from
-the length of the sequence, return `XAMErrors.cigar_query_length_mismatch`.
+the length of the sequence, return an `XAMError` of kind
+`XAMErrors.cigar_query_length_mismatch`.
 
 This operation will validate the underlying data, and then cache
 the constructed cigar such that subsequent calls to this function
@@ -540,14 +673,20 @@ Check if the flags of `record` contain `SAMFlag.READ2`.
 is_last(x::XAMRecord) = in(READ2, flags(x))
 
 """
-    get_header(::XAMReader)::SAMHeader
+    get_header(::SAMReader)::SAMHeader
+    get_header(::BAMReader)::Union{SAMHeader, XAMError}
 
 Get the header of the reader.
+
+For a `BAMReader`, the reference sequences are read from the binary part of the
+header (see [`references`](@ref)), so the text header is not needed to read records.
+If the text header is malformed, or its `@SQ` lines do not match the binary references,
+this returns an `XAMError`, and the records can still be read.
 """
 function get_header end
 
 """
-    mapping_span(record::XAMRecord)::Union{Nothing, UnitRange{Int}, CIGARError, XAMErrorKind}
+    mapping_span(record::XAMRecord)::Union{Nothing, UnitRange{Int}, CIGARError, XAMError}
 
 Return the 1-based positions in the reference that `record` is mapped to,
 or `nothing` if the position or CIGAR is not available, or the error
@@ -556,11 +695,11 @@ returned by [`cigar`](@ref) if the CIGAR is invalid.
 E.g. a record with CIGAR `10M100S` mapping to reference position 5
 would map to `5:14`.
 """
-function mapping_span(record::XAMRecord)::Union{Nothing, UnitRange{Int}, CIGARError, XAMErrorKind}
+function mapping_span(record::XAMRecord)::Union{Nothing, UnitRange{Int}, CIGARError, XAMError}
     left = @something left_position(record) return nothing
     cig = cigar(record)
     cig === nothing && return nothing
-    cig isa Union{CIGARError, XAMErrorKind} && return cig
+    cig isa Union{CIGARError, XAMError} && return cig
     return left:(left + CIGARStrings.ref_length(cig) - 1)
 end
 

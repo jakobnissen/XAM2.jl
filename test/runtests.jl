@@ -1,10 +1,10 @@
 using Test
 using XAM2
 using XAM2: XAMErrors, Reference, try_write, try_parse_header, seek_first_record
-using BGZFLib: BGZFReader, BGZFWriter
+using BGZFLib: BGZFReader, BGZFWriter, BGZFError, VirtualOffset
 using MemoryViews: ImmutableMemoryView, MemoryView
 using CIGARStrings: CIGAR, CIGARError
-using XAM2: AuxTag, SAMHeaderError
+using XAM2: AuxTag
 
 const DATADIR = joinpath(@__DIR__, "data")
 # Created from example.sam with `samtools view --no-PG -b -o example.bam example.sam`
@@ -12,6 +12,9 @@ const EXAMPLE_BAM = joinpath(DATADIR, "example.bam")
 const EXAMPLE_SAM = joinpath(DATADIR, "example.sam")
 
 parse_header(s::String) = try_parse_header(ImmutableMemoryView(s))::SAMHeader
+
+# The kind of an error value, or the value itself if it is not an error
+error_kind(x) = x isa XAMError ? x.kind : x
 
 read_bam(path::String) = BAMReader(collect, open(path); n_workers = 1)
 
@@ -72,7 +75,7 @@ summarize(r::BAMRecord) = (
     @test References(header) == References(["x", "y"], [10, 20])
     @test isempty(References(parse_header("@HD\tVN:1.6\n")))
     # Duplicate names are rejected by the header parser
-    @test try_parse_header(ImmutableMemoryView("@SQ\tSN:x\tLN:10\n@SQ\tSN:x\tLN:20\n")) isa SAMHeaderError
+    @test try_parse_header(ImmutableMemoryView("@SQ\tSN:x\tLN:10\n@SQ\tSN:x\tLN:20\n")) isa XAMError
 end
 
 @testset "BAMReader" begin
@@ -181,7 +184,7 @@ end
         @testset "Missing or mismatched references" begin
             path = tempname(dir)
             BAMWriter(open(path, "w"), no_sq_header, References(["chr1"], [1000]); n_workers = 1) do writer
-                @test map(r -> try_write(writer, r), records) == [
+                @test map(r -> error_kind(try_write(writer, r)), records) == [
                     60, 57,
                     XAMErrors.unknown_reference, # mate on chr2
                     XAMErrors.unknown_reference, # chr2
@@ -194,7 +197,7 @@ end
             @test map(summarize, read_bam(path)) == expected[[1, 2, 6]]
 
             BAMWriter(IOBuffer(), no_sq_header, References(["chr1"], [999]); n_workers = 1) do writer
-                @test try_write(writer, records[1]) == XAMErrors.reference_length_mismatch
+                @test try_write(writer, records[1]) == XAMError(XAMErrors.reference_length_mismatch)
                 @test try_write(writer, records[6]) isa Int
             end
         end

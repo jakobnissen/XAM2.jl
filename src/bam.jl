@@ -50,8 +50,9 @@ mutable struct BAMRecord
     const refs::References
 
     # This field is cached. Uninit means: Not computed. Nothing means no cigar.
-    # Otherwise, a cigar or invalid data.
-    cigar::Union{Uninit, Nothing, BAMCIGAR, CIGARError, XAMErrorKind}
+    # Otherwise, a cigar or CIGARError for malformed CIGAR, or XAMError for CIGAR
+    # whose length does not match the query length.
+    cigar::Union{Uninit, Nothing, BAMCIGAR, CIGARError, XAMError}
 
     # Fixed-length fields (see BAM specs for the details), in the same layout as in BAM,
     # such that they can be copied with `memcpy`.
@@ -175,7 +176,7 @@ function Base.show(io::IO, ::MIME"text/plain", record::BAMRecord)
     cig = cigar(record)
     if cig === nothing
         println(buf, "< missing >")
-    elseif cig isa Union{CIGARError, XAMErrorKind}
+    elseif cig isa Union{CIGARError, XAMError}
         println(buf, "< malformed CIGAR >")
     else
         str = String(MemoryView(CIGAR(cig)))
@@ -216,9 +217,21 @@ sequences with [`references`](@ref).
 
     BAMReader(bgzf::BGZFReader; copy::Bool=true)
 
-Construct a `BAMReader` from `io`, by wrapping `io` in a `BGZFLib.BGZFReader`.
+Construct a `BAMReader` from `io`, by wrapping `io` in a `BGZFLib.BGZFReader`,
+reading and validating the header.
 This reader takes control of `io`. Mutating `io` after the reader is constructed
 is not permitted. Closing the resulting reader will close `io`.
+If the binary header is malformed, `io` is closed and an `XAMError` is thrown.
+See [`XAM2.try_init`](@ref) for a version that returns the error instead.
+A malformed text header does not prevent reading records, see [`get_header`](@ref).
+
+Use `seek(reader, offset::VirtualOffset)` to seek to a record, e.g. to the
+`offset` of an `XAMError` returned when reading a record. Seeking to an offset outside
+the file, or to a block offset outside its block, throws a `BGZFLib.BGZFError`.
+
+Malformed BGZF compression does not throw when constructing the reader or reading
+records: it is returned as an `XAMError` of kind `XAMErrors.bgzf_error`. Errors from
+the underlying IO are thrown.
 
 If `copy` is `false`, every record returned by iterating the reader or from
 `XAM2.try_read!` will be the same record, overwritten in-place. This improves
@@ -230,23 +243,38 @@ The number of decompressing worker tasks is set by `n_workers`, which must be at
 mutable struct BAMReader{T <: AbstractBufReader}
     const reader::BGZFReader{T}
     const refs::References
-    const header::SAMHeader
+    # The text header, or the error from parsing it. It's not needed to read records,
+    # since the canonical information needed can be found in the References
+    const header::Union{SAMHeader, XAMError}
+    # Cached to seeking to start does not need to re-parse the header
     const offset_first_record::VirtualOffset
     const copy::Bool
     const record::BAMRecord
-    error::Union{Nothing, XAMErrorKind}
+    error::Union{Nothing, XAMError}
 end
 
-function new_bam_reader(reader::BGZFReader{T}, copy::Bool) where {T}
+function try_init(::Type{BAMReader}, reader::BGZFReader{T}; copy::Bool = true)::Union{BAMReader{T}, XAMError} where {T}
     buffer = UInt8[]
-    # TODO: Add a non-throwing constructor (see REVIEW.md, section 4)
-    parsed = parse_bam_header!(reader, buffer)
-    parsed isa SAMHeaderError && throw(parsed)
-    parsed isa XAMErrorKind && throw_xam_error(parsed)
+    parsed = close_on_throw(() -> parse_bam_header!(reader, buffer), reader)
+    if parsed isa XAMError
+        close(reader)
+        return parsed
+    end
     (; header, refs) = parsed
     vo_at_first_record = virtual_position(reader)
     record = new_bam_record(refs, buffer)
     return BAMReader{T}(reader, refs, header, vo_at_first_record, copy, record, nothing)
+end
+
+function try_init(
+        ::Type{BAMReader},
+        io::Union{IO, AbstractBufReader};
+        copy::Bool = true,
+        n_workers::Int = Threads.nthreads(),
+    )::Union{BAMReader, XAMError}
+    # The BGZFReader constructor reads from `io`, which may throw
+    bgzf = close_on_throw(() -> BGZFReader(io; n_workers), io)
+    return try_init(BAMReader, bgzf; copy)
 end
 
 get_header(reader::BAMReader) = reader.header
@@ -277,7 +305,7 @@ Base.eltype(::Type{<:BAMReader}) = BAMRecord
 function Base.iterate(reader::BAMReader, _::Nothing = nothing)
     result = try_read!(reader)
     result === nothing && return nothing
-    isa(result, XAMErrorKind) && throw_xam_error(result)
+    isa(result, XAMError) && throw(result)
     record = reader.copy ? copy(result) : result
     return (record, nothing)
 end
@@ -310,61 +338,73 @@ function Base.copy(record::BAMRecord)
 end
 
 function seek_first_record(reader::BAMReader)
-    seek(reader.reader, reader.offset_first_record)
+    return seek(reader, reader.offset_first_record)
+end
+
+function Base.seek(reader::BAMReader, offset::VirtualOffset)
+    # Seeking fills the buffer, which may fail on malformed BGZF data. Then, the error
+    # is returned on the next read, as if reading from `offset` failed.
+    result = catch_data_error(() -> seek(reader.reader, offset))
     reset!(reader.record)
-    # Errors are sticky until the reader is seeked, except if it's closed
-    reader.error == XAMErrors.closed_stream || (reader.error = nothing)
+    clear_error!(reader)
+    if result isa BGZFError
+        reader.error = XAMError(result; offset)
+    end
     return reader
+end
+
+# Fill `nbytes` of the header into `buffer`, or return the error.
+function fill_header_bytes!(reader::BGZFReader, buffer::Vector{UInt8}, nbytes::Int)::Union{ImmutableMemoryView{UInt8}, XAMError}
+    result = fill_bytes_to_data!(reader, buffer, nbytes)
+    result === nothing && return XAMError(XAMErrors.header_truncated)
+    result isa BGZFError && return XAMError(result)
+    return result
 end
 
 function parse_bam_header!(
         reader::BGZFReader,
         buffer::Vector{UInt8}
-    )::Union{
-        SAMHeaderError, XAMErrorKind, @NamedTuple{
-            header::SAMHeader,
-            refs::References,
-        }
-    }
+    )::Union{XAMError, @NamedTuple{header::Union{SAMHeader, XAMError}, refs::References}}
 
-    memview = fill_bytes_to_data!(reader, buffer, 8)
-    isnothing(memview) && return XAMErrors.header_truncated
+    memview = fill_header_bytes!(reader, buffer, 8)
+    memview isa XAMError && return memview
 
     magic = unsafe_load_integer_le(UInt32, memview, 1)
-    magic == 0x014d4142 || return XAMErrors.header_bad_magic_bytes
+    magic == 0x014d4142 || return XAMError(XAMErrors.header_bad_magic_bytes)
 
     l_text = unsafe_load_integer_le(UInt32, memview, 5)
-    l_text > typemax(Int32) % UInt32 && return XAMErrors.header_top_bit_set
+    l_text > typemax(Int32) % UInt32 && return XAMError(XAMErrors.header_top_bit_set)
 
-    memview = fill_bytes_to_data!(reader, buffer, l_text % Int + 4)
-    isnothing(memview) && return XAMErrors.header_truncated
+    memview = fill_header_bytes!(reader, buffer, l_text % Int + 4)
+    memview isa XAMError && return memview
 
     # The text may be padded with null bytes, which are not part of the header.
     # Copy the header because we need to store the data in the reader.
     text_len = something(findlast(!iszero, @inbounds(memview[1:(end - 4)])), 0)
     header_view = copy(@inbounds(memview[1:text_len]))
 
+    # Errors in the text header are stored, not returned, since it's not needed to read
+    # records.
     header = try_parse_header(header_view)
-    header isa SAMHeaderError && return header
     stringvec = StringVec()
     reflens = Int32[]
 
     n_ref = unsafe_load_integer_le(UInt32, memview, l_text % Int + 1)
-    n_ref > typemax(Int32) % UInt32 && return XAMErrors.header_top_bit_set
+    n_ref > typemax(Int32) % UInt32 && return XAMError(XAMErrors.header_top_bit_set)
 
     for _ in 1:(n_ref % Int)
-        memview = fill_bytes_to_data!(reader, buffer, 4)
-        isnothing(memview) && return XAMErrors.header_truncated
+        memview = fill_header_bytes!(reader, buffer, 4)
+        memview isa XAMError && return memview
 
         # Name length includes the trailing null byte
         l_name = unsafe_load_integer_le(UInt32, memview, 1)
-        in(l_name, 2:(typemax(Int32) % UInt32)) || return XAMErrors.invalid_reference
+        in(l_name, 2:(typemax(Int32) % UInt32)) || return XAMError(XAMErrors.invalid_reference)
         l_name = l_name % Int
 
-        memview = fill_bytes_to_data!(reader, buffer, l_name + 4)
-        isnothing(memview) && return XAMErrors.header_truncated
+        memview = fill_header_bytes!(reader, buffer, l_name + 4)
+        memview isa XAMError && return memview
 
-        @inbounds(memview[l_name]) == 0x00 || return XAMErrors.invalid_reference
+        @inbounds(memview[l_name]) == 0x00 || return XAMError(XAMErrors.invalid_reference)
         push_codeunits!(stringvec, @inbounds memview[1:(l_name - 1)])
 
         l_ref = unsafe_load_integer_le(Int32, memview, l_name + 1)
@@ -372,21 +412,28 @@ function parse_bam_header!(
     end
 
     refs = try_build_references(stringvec, reflens)
-    refs isa XAMErrorKind && return refs
-    # The binary references are used for records, but the text header must not disagree
-    header_matches_references(header, refs) || return XAMErrors.header_reference_mismatch
-    return (; header, refs)
+    refs isa XAMErrorKind && return XAMError(refs)
+    # The binary references are used for records, and the text header must not disagree
+    if header isa SAMHeader && !header_matches_references(header, refs)
+        header = XAMError(XAMErrors.header_reference_mismatch)
+    end
+    return @NamedTuple{header::Union{SAMHeader, XAMError}, refs::References}((header, refs))
 end
 
-function fill_bytes_to_data!(reader::BAMReader, nbytes::Int)::Union{ImmutableMemoryView{UInt8}, Nothing}
+function fill_bytes_to_data!(reader::BAMReader, nbytes::Int)::Union{ImmutableMemoryView{UInt8}, Nothing, BGZFError}
     return fill_bytes_to_data!(reader.reader, reader.record.data, nbytes)
 end
 
-function fill_bytes_to_data!(reader::AbstractBufReader, data::Vector{UInt8}, nbytes::Int)::Union{ImmutableMemoryView{UInt8}, Nothing}
+# Return the first `nbytes` of `data`, after copying them from `reader`.
+# Return `nothing` if `reader` is EOF before that, or a `BGZFError` if the BGZF data
+# is malformed.
+function fill_bytes_to_data!(reader::AbstractBufReader, data::Vector{UInt8}, nbytes::Int)::Union{ImmutableMemoryView{UInt8}, Nothing, BGZFError}
     length(data) < nbytes && resize!(data, nbytes)
     remaining = MemoryView(data)[1:nbytes]
     while !isempty(remaining)
-        buffer = @something get_nonempty_buffer(reader) return nothing
+        buffer = try_get_nonempty_buffer(reader)
+        buffer isa BGZFError && return buffer
+        buffer === nothing && return nothing
         mn = min(length(buffer), length(remaining))
         @assert mn > 0
         @assert mn <= length(buffer)
@@ -398,15 +445,58 @@ function fill_bytes_to_data!(reader::AbstractBufReader, data::Vector{UInt8}, nby
     return @inbounds ImmutableMemoryView(data)[1:nbytes]
 end
 
+# Like `BufferIO.get_nonempty_buffer`, but return a `BGZFError` on malformed BGZF data.
+# The buffer is only filled when empty, which is about once per BGZF block, so the cost
+# of `try` in `try_fill_buffer` is negligible.
+function try_get_nonempty_buffer(reader::AbstractBufReader)::Union{Nothing, ImmutableMemoryView{UInt8}, BGZFError}
+    buffer = get_buffer(reader)::ImmutableMemoryView{UInt8}
+    isempty(buffer) || return buffer
+    result = try_fill_buffer(reader)
+    result isa BGZFError && return result
+    buffer = get_buffer(reader)::ImmutableMemoryView{UInt8}
+    return isempty(buffer) ? nothing : buffer
+end
+
+# Fill the buffer, returning malformed BGZF data as a value. See `catch_data_error`.
+try_fill_buffer(reader::AbstractBufReader) = catch_data_error(() -> fill_buffer(reader))
+
+# Call `f()`, returning a `BGZFError` from malformed BGZF data as a value, and
+# propagating other exceptions, e.g. from the underlying IO.
+# After a `BGZFError`, the `BGZFReader` is in an error state until it is seeked.
+# TODO: Remove this when BufferIO supports errors as values.
+@noinline function catch_data_error(f)
+    return try
+        f()
+    catch e
+        (e isa BGZFError && is_data_error(e)) || rethrow()
+        e
+    end
+end
+
+# Check if the error is caused by malformed BGZF data, as opposed to misuse of the reader.
+# TODO: Upstream to BGZFLib.
+function is_data_error(e::BGZFError)::Bool
+    type = e.type
+    # Other errors are from LibDeflate, i.e. malformed gzip blocks or DEFLATE payloads
+    type isa BGZFErrors.BGZFErrorType || return true
+    # Not data errors: `block_offset_out_of_bounds` is a seek to an invalid offset,
+    # `insufficient_*_space` is a misconfigured reader or writer, and
+    # `operation_on_error` is a use of a reader in an error state.
+    return type in (BGZFErrors.truncated_file, BGZFErrors.missing_bc_field, BGZFErrors.invalid_index)
+end
+
 Base.isopen(x::BAMReader) = isopen(x.reader)
 
-function BAMReader(reader::BGZFReader{T}; copy::Bool = true) where {T}
-    return new_bam_reader(reader, copy)
+function BAMReader(reader::BGZFReader; copy::Bool = true)
+    result = try_init(BAMReader, reader; copy)
+    result isa XAMError && throw(result)
+    return result
 end
 
 function BAMReader(io::Union{IO, AbstractBufReader}; copy::Bool = true, n_workers::Int = Threads.nthreads())
-    reader = BGZFReader(io; n_workers)
-    return new_bam_reader(reader, copy)
+    result = try_init(BAMReader, io; copy, n_workers)
+    result isa XAMError && throw(result)
+    return result
 end
 
 
@@ -432,7 +522,7 @@ function Base.show(io::IO, ::MIME"text/plain", reader::BAMReader)
 end
 
 function Base.close(reader::BAMReader)
-    reader.error = XAMErrors.closed_stream
+    reader.error = XAMError(XAMErrors.closed_stream)
     return close(reader.reader)
 end
 
@@ -591,7 +681,7 @@ function left_position(record::BAMRecord)::Union{Int, Nothing}
     return iszero(result) ? nothing : result
 end
 
-function cigar(record::BAMRecord)::Union{Nothing, BAMCIGAR, CIGARError, XAMErrorKind}
+function cigar(record::BAMRecord)::Union{Nothing, BAMCIGAR, CIGARError, XAMError}
     record.cigar === Uninit() || return record.cigar
     encoding = get_cigar_encoding(record)
     if encoding === nothing
@@ -654,12 +744,13 @@ function unsafe_load_fixed_fields(record::BAMRecord, buffer::ImmutableMemoryView
 end
 
 """
-    XAM2.try_read!(reader::BAMReader)::Union{BAMRecord, Nothing, XAMErrorKind}
+    XAM2.try_read!(reader::BAMReader)::Union{BAMRecord, Nothing, XAMError}
 
 Attempt to read the next record of `reader`, similar to iterating the reader.
 If the reader is EOF, return `nothing`.
-If the next record is malformed, return a `XAMErrorKind`.
-Once this function returns a `XAMErrorKind`, subsequent calls to this function
+If the next record is malformed, return an `XAMError` with the virtual offset
+of the start of the record.
+Once this function returns an `XAMError`, subsequent calls to this function
 will return the same error until the reader is closed or seeked.
 
 The structure of the record is validated, e.g. that its fields fit in the record,
@@ -668,40 +759,62 @@ fields, e.g. the CIGAR, is validated when it is accessed.
 
 This function does not throw if the reader's data is malformed.
 """
-function try_read!(x::BAMReader)::Union{BAMRecord, Nothing, XAMErrorKind}
+function try_read!(x::BAMReader)::Union{BAMRecord, Nothing, XAMError}
     isnothing(x.error) || return x.error
 
     # Check if EOF and return that error if so
-    buffer = get_nonempty_buffer(x.reader)
+    buffer = try_get_nonempty_buffer(x.reader)
+    # The malformed block is where the next record starts, so seeking there reproduces
+    # the error.
+    buffer isa BGZFError && return fail_read!(x, XAMError(buffer; offset = block_start(buffer)))
     isnothing(buffer) && return nothing
+    # Since the buffer is non-empty, this is in the block containing the record's start
+    offset = virtual_position(x.reader)
 
     record = x.record
     record.cigar = Uninit()
 
     # Read the block size, and the fixed-length fields into the record
     memview = fill_bytes_to_data!(x, 4 + BAM_FIXED_BYTES)
-    isnothing(memview) && return fail_read!(x, XAMErrors.truncated_file)
+    memview isa ImmutableMemoryView || return fail_read!(x, fill_error(memview, offset))
     stored_block_size = unsafe_load_integer_le(UInt32, memview, 1)
     unsafe_load_fixed_fields(record, @inbounds memview[5:end])
     err = check_fixed_fields(record, stored_block_size)
-    err === nothing || return fail_read!(x, err)
+    err === nothing || return fail_read!(x, XAMError(err; offset))
 
     # Read all the variable length fields, overwriting the fixed field bytes,
     # which we have already moved into the integer fields of the struct
     data_len = (stored_block_size - UInt32(BAM_FIXED_BYTES)) % Int
     memview = fill_bytes_to_data!(x, data_len)
-    isnothing(memview) && return fail_read!(x, XAMErrors.truncated_file)
+    memview isa ImmutableMemoryView || return fail_read!(x, fill_error(memview, offset))
     resize!(record.data, data_len)
-    @inbounds(record.data[record.l_read_name]) == 0x00 || return fail_read!(x, XAMErrors.invalid_read_name)
+    @inbounds(record.data[record.l_read_name]) == 0x00 ||
+        return fail_read!(x, XAMError(XAMErrors.invalid_read_name; offset))
     return record
 end
 
 # Set the reader's sticky error, and reset its record, since a failed read
 # may leave the record in a state that violates its invariants.
-@noinline function fail_read!(x::BAMReader, err::XAMErrorKind)::XAMErrorKind
+@noinline function fail_read!(x::BAMReader, err::XAMError)::XAMError
     reset!(x.record)
     x.error = err
     return err
+end
+
+# The error when a record could not be read in full, where `offset` is the start of
+# the record.
+function fill_error(result::Union{Nothing, BGZFError}, offset::VirtualOffset)::XAMError
+    return if result === nothing
+        XAMError(XAMErrors.truncated_file; offset)
+    else
+        XAMError(result; offset)
+    end
+end
+
+# The virtual offset of the start of the block of a BGZF error, if known
+function block_start(e::BGZFError)::Union{Nothing, VirtualOffset}
+    file_offset = e.file_offset
+    return file_offset === nothing ? nothing : VirtualOffset(file_offset, 0)
 end
 
 # Check the structural invariants of `record` that only depend on its fixed fields,
@@ -758,7 +871,10 @@ See [`XAM2.try_write`](@ref).
 # Examples
 ```julia
 BAMReader(open("in.bam")) do reader
-    BAMWriter(open("out.bam", "w"), get_header(reader), references(reader)) do writer
+    # The text header of a BAM file may be malformed, see `get_header`
+    header = get_header(reader)
+    header isa XAMError && throw(header)
+    BAMWriter(open("out.bam", "w"), header, references(reader)) do writer
         for record in reader
             is_mapped(record) && write(writer, record)
         end
@@ -856,17 +972,23 @@ Base.close(writer::BAMWriter) = close(writer.writer)
 Base.flush(writer::BAMWriter) = flush(writer.writer)
 
 """
-    XAM2.try_write(writer::BAMWriter, record::BAMRecord)::Union{Int, XAMErrorKind}
+    XAM2.try_write(writer::BAMWriter, record::BAMRecord)::Union{Int, XAMError}
 
 Write `record` to `writer`, and return the number of bytes written.
 If the record can't be represented using the references of `writer`, write nothing,
-and return an `XAMErrorKind`. This happens if the reference or next reference of
+and return an `XAMError`. This happens if the reference or next reference of
 `record` is not present in `writer`, or if it has a different length in `writer`.
 Errors from the underlying IO are thrown.
 
 See also: [`BAMWriter`](@ref)
 """
-function try_write(writer::BAMWriter, record::BAMRecord)::Union{Int, XAMErrorKind}
+function try_write(writer::BAMWriter, record::BAMRecord)::Union{Int, XAMError}
+    result = try_write_kind(writer, record)
+    result isa XAMErrorKind && return XAMError(result)
+    return result
+end
+
+function try_write_kind(writer::BAMWriter, record::BAMRecord)::Union{Int, XAMErrorKind}
     src = record.refs
     map = src === writer.refs ? nothing : reference_map!(writer, src)
     (ref_id, next_ref_id) = if map === nothing
@@ -886,7 +1008,7 @@ end
 
 function Base.write(writer::BAMWriter, record::BAMRecord)
     result = try_write(writer, record)
-    result isa XAMErrorKind && throw_xam_error(result)
+    result isa XAMError && throw(result)
     return result
 end
 
@@ -990,8 +1112,8 @@ function Base.copy!(dst::BAMRecord, src::SAMRecord)
         0
     elseif cig isa CIGARError
         throw_xam_error(XAMErrors.invalid_cigar)
-    elseif cig isa XAMErrorKind
-        throw_xam_error(cig)
+    elseif cig isa XAMError
+        throw(cig)
     else
         cigar_too_big = length(cig) > typemax(UInt16)
         # If CIGAR is to big, we store this dummy value and store the real cigar in an AUX tag
@@ -1145,7 +1267,7 @@ function Base.copy!(dst::SAMRecord, src::BAMRecord)
     # Throw before modifying `dst`, so it's never left in an invalid state
     cig = cigar(src)
     cig isa CIGARError && throw_xam_error(XAMErrors.invalid_cigar)
-    cig isa XAMErrorKind && throw_xam_error(cig)
+    cig isa XAMError && throw(cig)
 
     data = dst.data
     empty!(data)

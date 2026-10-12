@@ -35,7 +35,8 @@ const SAM_MACHINE = let
 end
 
 # Numeric fields are accumulated in `n`, and checked when the field is exited.
-# Out-of-range numbers return the error of the field.
+# Out-of-range numbers return the error of the field. When a field is exited, `p` is
+# the index of the byte after it.
 const SAM_ACTIONS = Dict{Symbol, Expr}(
     :digit => quote
         (n, overflow) = Base.Checked.mul_with_overflow(n, UInt64(0x0a))
@@ -46,22 +47,22 @@ const SAM_ACTIONS = Dict{Symbol, Expr}(
     :mark => :(mark = p),
     :qname => quote
         # QNAME's length can be 1:254
-        p > 255 && return XAMErrors.invalid_read_name
+        p > 255 && return sam_field_error(data, XAMErrors.invalid_read_name, p)
         record.qname_len = (p - 1) % UInt8
     end,
     :flag => quote
-        (has_overflowed | (n > typemax(UInt16))) && return XAMErrors.invalid_flags
+        (has_overflowed | (n > typemax(UInt16))) && return sam_field_error(data, XAMErrors.invalid_flags, p)
         record.flags = new_sam_flags(n % UInt16)
         n = zero(UInt64)
     end,
     :rname => :(record.rname_span = (mark % UInt32, (p - 1) % UInt32)),
     :pos => quote
-        (has_overflowed | (n > (typemax(Int32) % UInt64))) && return XAMErrors.invalid_position
+        (has_overflowed | (n > (typemax(Int32) % UInt64))) && return sam_field_error(data, XAMErrors.invalid_position, p)
         record.pos = n % UInt32
         n = zero(UInt64)
     end,
     :mapq => quote
-        (has_overflowed | (n > typemax(UInt8))) && return XAMErrors.invalid_mapq
+        (has_overflowed | (n > typemax(UInt8))) && return sam_field_error(data, XAMErrors.invalid_mapq, p)
         record.mapq = n % UInt8
         n = zero(UInt64)
     end,
@@ -69,14 +70,14 @@ const SAM_ACTIONS = Dict{Symbol, Expr}(
     :rnext => :(record.rnext_span = (mark % UInt32, (p - 1) % UInt32)),
     :pnext => quote
         (has_overflowed | (n > (typemax(Int32) % UInt64))) &&
-            return XAMErrors.invalid_next_position
+            return sam_field_error(data, XAMErrors.invalid_next_position, p)
         record.pnext = n % UInt32
         n = zero(UInt64)
     end,
     :negative => :(is_negative = true),
     :tlen => quote
         maxval = (typemax(Int32) % UInt64) + is_negative
-        (has_overflowed | (n > maxval)) && return XAMErrors.invalid_template_length
+        (has_overflowed | (n > maxval)) && return sam_field_error(data, XAMErrors.invalid_template_length, p)
         n32 = n % Int32
         record.tlen = is_negative ? -n32 : n32
     end,
@@ -136,7 +137,7 @@ mutable struct SAMRecord
 
     # Data contains the unmodified input line.
     data::Vector{UInt8}
-    cigar::Union{Uninit, Nothing, CIGAR, CIGARError, XAMErrorKind}
+    cigar::Union{Uninit, Nothing, CIGAR, CIGARError, XAMError}
 
     # Inclusive start and stop indices of RNAME and RNEXT in `data`
     rname_span::Tuple{UInt32, UInt32}
@@ -163,21 +164,22 @@ end
     XAM2.try_parse!(
         record::SAMRecord,
         data::ImmutableMemoryView{UInt8}
-    )::Union{SAMRecord, XAMErrorKind}
+    )::Union{SAMRecord, XAMError}
 
 Parse the line `data` (without a trailing newline) as a SAM record into `record`,
 returning it. The structure of the record is validated, e.g. that it has 11 fields,
 and that the fixed-length fields are valid. The CIGAR and auxiliary data are
 validated when accessed.
 
-If the data is invalid, `record` is reset to an empty record, and an
-`XAMErrorKind` is returned that identifies which field is invalid.
+If the data is invalid, `record` is reset to an empty record, and an `XAMError` is
+returned. Its kind identifies which field is invalid, and its column is the position
+of the invalid byte, or the start of the field if its value is out of range.
 
 This function does not throw if `data` is malformed.
 """
-function try_parse!(record::SAMRecord, data::ImmutableMemoryView{UInt8})::Union{SAMRecord, XAMErrorKind}
+function try_parse!(record::SAMRecord, data::ImmutableMemoryView{UInt8})::Union{SAMRecord, XAMError}
     err = if length(data) ≥ typemax(UInt32)
-        XAMErrors.line_too_long
+        XAMError(XAMErrors.line_too_long)
     else
         copyto!(resize!(record.data, length(data)), data)
         record.cigar = Uninit()
@@ -194,7 +196,7 @@ function try_parse!(record::SAMRecord, data::ImmutableMemoryView{UInt8})::Union{
     return record
 end
 
-@eval function parse_sam_fields!(record::SAMRecord, data::ImmutableMemoryView{UInt8})::Union{Nothing, XAMErrorKind}
+@eval function parse_sam_fields!(record::SAMRecord, data::ImmutableMemoryView{UInt8})::Union{Nothing, XAMError}
     n = UInt64(0)
     is_negative = false
     has_overflowed = false
@@ -227,23 +229,41 @@ const SAM_FIELD_ERRORS = (
 )
 
 # Slow path, only run when the machine fails: Find the field where the error is.
-@noinline function sam_syntax_error(data::ImmutableMemoryView{UInt8}, p::Int, cs::Int)::XAMErrorKind
+@noinline function sam_syntax_error(data::ImmutableMemoryView{UInt8}, p::Int, cs::Int)::XAMError
     # On error, p is the index of the invalid byte, and if the input ended early,
     # p is length(data) + 1.
     field = count(==(UInt8('\t')), @inbounds(data[1:(p - 1)])) + 1
-    # Input ended before the 11th field
-    (cs > 0 && field < 11) && return XAMErrors.missing_fields
-    return field > 11 ? XAMErrors.invalid_aux_data : @inbounds(SAM_FIELD_ERRORS[field])
+    kind = if cs > 0 && field < 11
+        # Input ended before the 11th field
+        XAMErrors.missing_fields
+    elseif field > 11
+        XAMErrors.invalid_aux_data
+    else
+        @inbounds(SAM_FIELD_ERRORS[field])
+    end
+    return XAMError(kind; column = p)
+end
+
+# Slow path for a field with an out-of-range value, where `p` is the index after the
+# field. The column of the error is the start of the field.
+@noinline function sam_field_error(data::ImmutableMemoryView{UInt8}, kind::XAMErrorKind, p::Int)::XAMError
+    tab = findprev(==(UInt8('\t')), data, p - 1)
+    return XAMError(kind; column = something(tab, 0) + 1)
 end
 
 # Check that QUAL is missing if SEQ is, and else has the same length.
-function check_seq_qual(record::SAMRecord)::Union{Nothing, XAMErrorKind}
+function check_seq_qual(record::SAMRecord)::Union{Nothing, XAMError}
     seq = seq_view(record)
     qual = qual_view(record)
     is_missing(qual) && return nothing
-    is_missing(seq) && return XAMErrors.qual_no_seq
-    length(seq) == length(qual) || return XAMErrors.qual_seq_mismatch
-    return nothing
+    kind = if is_missing(seq)
+        XAMErrors.qual_no_seq
+    elseif length(seq) != length(qual)
+        XAMErrors.qual_seq_mismatch
+    else
+        return nothing
+    end
+    return XAMError(kind; column = (record.qual_offset % Int) + 1)
 end
 
 # Check if a field is `*`, meaning missing
@@ -277,7 +297,7 @@ Parse the `data` into a `record`, or throw a `XAMError` if the data is invalid.
 """
 function parse!(record::SAMRecord, data::ImmutableMemoryView{UInt8})
     result = try_parse!(record, data)
-    result isa XAMErrorKind && throw_xam_error(result)
+    result isa XAMError && throw(result)
     return result
 end
 
@@ -417,7 +437,7 @@ function Base.show(io::IO, ::MIME"text/plain", record::SAMRecord)
     cig = cigar(record)
     if cig === nothing
         println(buf, "< missing >")
-    elseif cig isa Union{CIGARError, XAMErrorKind}
+    elseif cig isa Union{CIGARError, XAMError}
         println(buf, "< malformed CIGAR >")
     else
         str = String(MemoryView(CIGAR(cig)))
@@ -453,7 +473,7 @@ function reference_name(record::SAMRecord)::Union{Nothing, AbstractString}
     return is_missing(view) ? nothing : StringView(view)
 end
 
-function cigar(record::SAMRecord)::Union{Nothing, CIGAR, CIGARError, XAMErrorKind}
+function cigar(record::SAMRecord)::Union{Nothing, CIGAR, CIGARError, XAMError}
     record.cigar === Uninit() || return record.cigar
     view = cigar_view(record)
     if is_missing(view)
@@ -538,7 +558,7 @@ end
 
 """
     mutable struct SAMReader{T <: AbstractBufReader}
-
+    
 Lazy reader of SAM files.
 
 `rdr = SAMReader` is an iterator over `SAMRecord`.
@@ -549,9 +569,11 @@ The header can be obtained with [`get_header`](@ref)
         copy::Bool = true,
     )::SAMReader
 
-Construct a `SAMReader` from `io`.
+Construct a `SAMReader` from `io`, reading and validating the header.
 This reader takes control of `io`. Mutating `io` after the reader is constructed
 is not permitted. Closing the resulting reader will close `io`.
+If the header is malformed, `io` is closed and an `XAMError` is thrown.
+See [`XAM2.try_init`](@ref) for a version that returns the error instead.
 
 If `copy` is `false`, every record returned by iterating the reader or from
 `XAM2.try_read!` will be the same record, overwritten in-place. This improves
@@ -564,18 +586,58 @@ mutable struct SAMReader{T <: AbstractBufReader}
     const record::SAMRecord
     const offset_first_record::Int
     const header::SAMHeader
+    # Number of lines in the header, used to compute line numbers of records
+    const n_header_lines::Int
     const copy::Bool
-    error::Union{Nothing, XAMErrorKind}
+    # Number of records read since the first record, including a failed one
+    n_records::Int
+    error::Union{Nothing, XAMError}
 end
 
-function SAMReader(reader::AbstractBufReader; copy::Bool = true)
-    (header, offset_first_record) = read_initial_sam_header!(reader)
-    record = SAMRecord()
-    return SAMReader{typeof(reader)}(reader, record, offset_first_record, header, copy, nothing)
+"""
+    XAM2.try_init(::Type{SAMReader}, io::Union{IO, AbstractBufReader}; copy::Bool = true)::Union{SAMReader, XAMError}
+    XAM2.try_init(::Type{BAMReader}, io::Union{IO, AbstractBufReader}; copy::Bool = true, n_workers::Int = Threads.nthreads())::Union{BAMReader, XAMError}
+    XAM2.try_init(::Type{BAMReader}, bgzf::BGZFReader; copy::Bool = true)::Union{BAMReader, XAMError}
+
+Construct a reader like its constructor does, but return an `XAMError` instead of
+throwing if the header is malformed.
+
+This function does not throw if the header is malformed. Errors from the underlying IO
+are thrown, including errors from `BGZFLib` if the BGZF compression of a BAM file
+is malformed. If construction fails, either by returning an error or throwing,
+`io` is closed, since the reader takes ownership of it.
+
+# Examples
+```julia
+reader = XAM2.try_init(SAMReader, open("file.sam"))
+if reader isa XAMError
+    println("Malformed header: ", sprint(showerror, reader))
+else
+    # use reader
+end
+```
+"""
+function try_init end
+
+function try_init(::Type{SAMReader}, reader::AbstractBufReader; copy::Bool = true)::Union{SAMReader, XAMError}
+    header = close_on_throw(() -> read_initial_sam_header!(reader), reader)
+    if header isa XAMError
+        close(reader)
+        return header
+    end
+    data = MemoryView(header)
+    n_header_lines = count(==(UInt8('\n')), data)
+    return SAMReader{typeof(reader)}(reader, SAMRecord(), length(data), header, n_header_lines, copy, 0, nothing)
 end
 
-function SAMReader(io::IO; copy::Bool = true)
-    return SAMReader(BufReader(io); copy)
+function try_init(::Type{SAMReader}, io::IO; copy::Bool = true)::Union{SAMReader, XAMError}
+    return try_init(SAMReader, BufReader(io); copy)
+end
+
+function SAMReader(io::Union{IO, AbstractBufReader}; copy::Bool = true)
+    reader = try_init(SAMReader, io; copy)
+    reader isa XAMError && throw(reader)
+    return reader
 end
 
 function SAMReader(f::Function, args...; kwargs...)
@@ -588,7 +650,7 @@ function SAMReader(f::Function, args...; kwargs...)
 end
 
 function Base.close(reader::SAMReader)
-    reader.error = XAMErrors.closed_stream
+    reader.error = XAMError(XAMErrors.closed_stream)
     return close(reader.reader)
 end
 
@@ -606,7 +668,7 @@ function Base.show(io::IO, ::MIME"text/plain", reader::SAMReader)
     return print(io, "TODO!")
 end
 
-function read_initial_sam_header!(reader::AbstractBufReader)
+function read_initial_sam_header!(reader::AbstractBufReader)::Union{SAMHeader, XAMError}
     # We need to store a copy of the underlying data, and can't just store
     # a view into the reader, because we mutate the reader
     # TODO: Is it too inefficient to do two passes over the header, one to
@@ -619,18 +681,14 @@ function read_initial_sam_header!(reader::AbstractBufReader)
         end
         write(buffer, line_view)
     end
-    data = get_unflushed(buffer)
-    offset = length(data)
-    header = try_parse_header(ImmutableMemoryView(data))
-    header isa SAMHeaderError && throw(header)
-    return (header, offset)
+    return try_parse_header(ImmutableMemoryView(get_unflushed(buffer)))
 end
 
 function seek_first_record(reader::SAMReader)
     seek(reader.reader, reader.offset_first_record)
     reset!(reader.record)
-    # Errors are sticky until the reader is seeked, except if it's closed
-    reader.error == XAMErrors.closed_stream || (reader.error = nothing)
+    reader.n_records = 0
+    clear_error!(reader)
     return reader
 end
 
@@ -640,18 +698,19 @@ Base.eltype(::Type{<:SAMReader}) = SAMRecord
 function Base.iterate(reader::SAMReader, _::Nothing = nothing)
     result = try_read!(reader)
     result === nothing && return nothing
-    isa(result, XAMErrorKind) && throw_xam_error(result)
+    isa(result, XAMError) && throw(result)
     record = reader.copy ? copy(result) : result
     return (record, nothing)
 end
 
 """
-    XAM2.try_read!(reader::SAMReader)::Union{SAMRecord, Nothing, XAMErrorKind}
+    XAM2.try_read!(reader::SAMReader)::Union{SAMRecord, Nothing, XAMError}
 
 Attempt to read the next record of `reader`, similar to iterating the reader.
 If the reader is EOF, return `nothing`.
-If the next record is malformed, return a `XAMErrorKind`.
-Once this function returns a `XAMErrorKind`, subsequent calls to this function
+If the next record is malformed, return an `XAMError`, with the record number,
+line and column of the error.
+Once this function returns an `XAMError`, subsequent calls to this function
 will return the same error until the reader is closed or seeked.
 
 The record is parsed with [`XAM2.try_parse!`](@ref), see its documentation for
@@ -659,20 +718,27 @@ what is validated.
 
 This function does not throw if the reader's data is malformed.
 """
-function try_read!(reader::SAMReader)::Union{SAMRecord, Nothing, XAMErrorKind}
+function try_read!(reader::SAMReader)::Union{SAMRecord, Nothing, XAMError}
     isnothing(reader.error) || return reader.error
     # Get a view of the current line, stripped from newline
     line_view = get_next_line_view(reader.reader)
     line_view === nothing && return nothing
+    reader.n_records += 1
     result = try_parse!(reader.record, _chomp(line_view))
     @inbounds consume(reader.reader, length(line_view))
     # On failure, `try_parse!` has already reset the record
-    result isa XAMErrorKind && (reader.error = result)
+    result isa XAMError && return fail_read!(reader, result)
     return result
 end
 
-# Inlined, so the returned `Union` is not allocated
-@inline function get_next_line_view(
+@noinline function fail_read!(reader::SAMReader, err::XAMError)::XAMError
+    record = reader.n_records
+    err = XAMError(err.kind; record, line = reader.n_header_lines + record, err.column)
+    reader.error = err
+    return err
+end
+
+function get_next_line_view(
         reader::AbstractBufReader
     )::Union{ImmutableMemoryView{UInt8}, Nothing}
     scan_from = 1

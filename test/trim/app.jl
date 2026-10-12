@@ -11,7 +11,7 @@ using XAM2:
     SAMReader,
     References,
     SAMHeader,
-    XAMErrorKind,
+    XAMError,
     references,
     query_name,
     reference_name,
@@ -56,7 +56,7 @@ function (@main)(args::Vector{String})::Cint
     writer = BAMWriter(open(out_path, "w"), header, reversed; n_workers = 1)
     n_errors = 0
     for record in reader
-        n_errors += try_write(writer, record) isa XAMErrorKind
+        n_errors += try_write(writer, record) isa XAMError
     end
     close(writer)
     close(reader)

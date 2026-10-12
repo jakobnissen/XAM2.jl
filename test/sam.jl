@@ -81,8 +81,8 @@ end
         # The CIGAR is validated lazily
         record = try_parse_line(with_field(6, "3M"))
         @test record isa SAMRecord
-        @test XAM2.cigar(record) == XAMErrors.cigar_query_length_mismatch
-        @test mapping_span(record) == XAMErrors.cigar_query_length_mismatch
+        @test XAM2.cigar(record) == XAMError(XAMErrors.cigar_query_length_mismatch)
+        @test mapping_span(record) == XAMError(XAMErrors.cigar_query_length_mismatch)
         record = try_parse_line(with_field(6, "0M4I"))
         @test XAM2.cigar(record) isa CIGARError
         @test sprint(show, MIME"text/plain"(), record) isa String
@@ -131,22 +131,37 @@ end
                 (11, "III", XAMErrors.qual_seq_mismatch),
                 (10, "*", XAMErrors.qual_no_seq),
             ]
-            @test try_parse_line(with_field(field, value)) == err
+            @test error_kind(try_parse_line(with_field(field, value))) == err
         end
 
         line = sam_line(VALID_FIELDS)
-        @test try_parse_line("") == XAMErrors.missing_fields
-        @test try_parse_line(sam_line(VALID_FIELDS[1:10])) == XAMErrors.missing_fields
-        @test try_parse_line(sam_line(VALID_FIELDS[1:3])) == XAMErrors.missing_fields
-        @test try_parse_line(line * "\t") == XAMErrors.invalid_aux_data
-        @test try_parse_line(line * "\tXA:Z:é") == XAMErrors.invalid_aux_data
-        @test try_parse_line(line * "\r") == XAMErrors.invalid_quality
-        @test try_parse_line(line * "\n") == XAMErrors.invalid_quality
-        @test try_parse_line(replace(line, "\tACGT" => "\tAC\nGT")) == XAMErrors.invalid_sequence
+        @test error_kind(try_parse_line("")) == XAMErrors.missing_fields
+        @test error_kind(try_parse_line(sam_line(VALID_FIELDS[1:10]))) == XAMErrors.missing_fields
+        @test error_kind(try_parse_line(sam_line(VALID_FIELDS[1:3]))) == XAMErrors.missing_fields
+        @test error_kind(try_parse_line(line * "\t")) == XAMErrors.invalid_aux_data
+        @test error_kind(try_parse_line(line * "\tXA:Z:é")) == XAMErrors.invalid_aux_data
+        @test error_kind(try_parse_line(line * "\r")) == XAMErrors.invalid_quality
+        @test error_kind(try_parse_line(line * "\n")) == XAMErrors.invalid_quality
+        @test error_kind(try_parse_line(replace(line, "\tACGT" => "\tAC\nGT"))) == XAMErrors.invalid_sequence
+
+        # Columns: The invalid byte for syntax errors, the start of the field for
+        # out-of-range values, and the end of the line if it ends early
+        column(line) = try_parse_line(line).column
+        # Column of the first byte of field `i`
+        field_start(i) = ncodeunits(sam_line(VALID_FIELDS[1:(i - 1)])) + 2
+        @test field_start(4) == 12
+        @test column(with_field(4, "12x4")) == field_start(4) + 2
+        @test column(with_field(4, "2147483648")) == field_start(4)
+        @test column(with_field(1, "!"^255)) == 1
+        @test column(with_field(11, "III")) == field_start(11)
+        @test column(sam_line(VALID_FIELDS[1:3])) == ncodeunits(sam_line(VALID_FIELDS[1:3])) + 1
+        @test try_parse_line(with_field(4, "-1")) == XAMError(XAMErrors.invalid_position; column = 12)
+        @test sprint(showerror, try_parse_line(with_field(4, "-1"))) ==
+            "XAMError: invalid position (POS) at column 12"
 
         # A failed parse resets the record, even if it was previously valid
         record = try_parse_line(line)
-        @test XAM2.try_parse!(record, ImmutableMemoryView(with_field(5, "256"))) == XAMErrors.invalid_mapq
+        @test error_kind(XAM2.try_parse!(record, ImmutableMemoryView(with_field(5, "256")))) == XAMErrors.invalid_mapq
         @test is_reset(record)
         @test_throws XAMError XAM2.parse!(record, ImmutableMemoryView(with_field(5, "256")))
     end
@@ -221,27 +236,46 @@ summarize(r::SAMRecord) = (
     @test isempty(SAMReader(collect, IOBuffer("")))
 
     # Invalid header
-    @test_throws SAMHeaderError SAMReader(IOBuffer("@HD\tVN:1.6\n@XX\n"))
+    @test_throws XAMError SAMReader(IOBuffer("@HD\tVN:1.6\n@XX\n"))
 
     @testset "Errors are sticky, and the record stays valid" begin
-        data = join([sam_line(VALID_FIELDS), with_field(4, "-1"), sam_line(VALID_FIELDS)], '\n')
+        data = "@HD\tVN:1.6\n@CO\tx\n" *
+            join([sam_line(VALID_FIELDS), with_field(4, "-1"), sam_line(VALID_FIELDS)], '\n')
+        expected = XAMError(XAMErrors.invalid_position; record = 2, line = 4, column = 12)
         path = tempname()
         write(path, data)
         reader = SAMReader(open(path); copy = false)
         record = XAM2.try_read!(reader)
         @test query_name(record) == "r1"
-        @test XAM2.try_read!(reader) == XAMErrors.invalid_position
+        @test XAM2.try_read!(reader) == expected
         @test is_reset(record)
-        @test XAM2.try_read!(reader) == XAMErrors.invalid_position
+        @test XAM2.try_read!(reader) === expected
+        @test sprint(showerror, expected) ==
+            "XAMError: invalid position (POS) at record 2, line 4, column 12"
         @test_throws XAMError iterate(reader)
 
         # Seeking clears the error
         seek_first_record(reader)
         @test query_name(XAM2.try_read!(reader)) == "r1"
-        @test XAM2.try_read!(reader) == XAMErrors.invalid_position
+        @test XAM2.try_read!(reader) == expected
 
         # Closing sets a permanent error
         close(reader)
-        @test XAM2.try_read!(reader) == XAMErrors.closed_stream
+        @test error_kind(XAM2.try_read!(reader)) == XAMErrors.closed_stream
+    end
+
+    @testset "try_init" begin
+        reader = XAM2.try_init(SAMReader, open(EXAMPLE_SAM))
+        @test reader isa SAMReader
+        @test length(collect(reader)) == 6
+        close(reader)
+
+        # On failure, the error is returned, and the input is closed
+        io = IOBuffer("@HD\tVN:1.6\n@SQ\tSN:x\n" * sam_line(VALID_FIELDS))
+        @test XAM2.try_init(SAMReader, io) == XAMError(XAMErrors.header_missing_ln; line = 2, column = 1)
+        @test !isopen(io)
+        io = IOBuffer("@HD\tVN:1.6\n@SQ\tSN:x\n")
+        @test_throws XAMError(XAMErrors.header_missing_ln; line = 2, column = 1) SAMReader(io)
+        @test !isopen(io)
     end
 end
