@@ -27,7 +27,7 @@ module SortOrders
 
     1-byte enum with the available sort orders in the SAM/BAM format.
     Currently, as per the SAM specs, the following are defined:
-    `unknown`, `unsorted`, `queryname`, `corrdinate`
+    `unknown`, `unsorted`, `queryname`, `coordinate`
     """
     @enum SortOrder::UInt8 unknown unsorted queryname coordinate
     export SortOrder, unknown, unsorted, queryname, coordinate
@@ -318,19 +318,7 @@ end with a newline. The returned header aliases `data`.
 """
 function try_parse_header(data::ImmutableMemoryView{UInt8})::Union{SAMHeader, XAMError}
     state = HeaderParseState()
-    line_number = 0
-    rest = data
-    while !isempty(rest)
-        line_number += 1
-        newline = findfirst(==(UInt8('\n')), rest)
-        (line, rest) = if newline === nothing
-            (rest, @inbounds rest[(end + 1):end])
-        else
-            (@inbounds(rest[1:(newline - 1)]), @inbounds(rest[(newline + 1):end]))
-        end
-        if !isempty(line) && @inbounds(line[end]) == UInt8('\r')
-            line = @inbounds line[1:(end - 1)]
-        end
+    for (line_number, line) in enumerate(each_header_line(data))
         err = parse_header_line!(state, line, line_number)
         if err !== nothing
             (column, kind) = err
@@ -338,6 +326,25 @@ function try_parse_header(data::ImmutableMemoryView{UInt8})::Union{SAMHeader, XA
         end
     end
     return SAMHeader(data, state.hd, state.sqs, state.cos, state.rgs, state.pgs)
+end
+
+# Iterator of the lines of SAM header text, without the line terminators,
+# which are `\n` or `\r\n`. The last line need not end with a newline.
+function each_header_line(data::ImmutableMemoryView{UInt8})
+    # A final newline ends the last line, rather than starting an empty line.
+    # But if the newline is the only byte, it ends an empty line, which is invalid.
+    if length(data) > 1 && @inbounds(data[end]) == UInt8('\n')
+        data = @inbounds data[1:(end - 1)]
+    end
+    return Iterators.map(strip_carriage_return, split_each(data, UInt8('\n')))
+end
+
+function strip_carriage_return(line::ImmutableMemoryView{UInt8})::ImmutableMemoryView{UInt8}
+    return if !isempty(line) && @inbounds(line[end]) == UInt8('\r')
+        @inbounds line[1:(end - 1)]
+    else
+        line
+    end
 end
 
 struct HeaderField

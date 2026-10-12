@@ -77,7 +77,20 @@ public try_parse!,
     Reference,
     reference,
     try_parse_header,
-    HasEq
+    HasEq,
+    AbstractHeader,
+    HeaderHD,
+    HeaderSQ,
+    HeaderRG,
+    HeaderPG,
+    SortOrders,
+    SortOrder,
+    Topologies,
+    Topology,
+    add_program,
+    add_read_group,
+    set_sort_order,
+    with_references
 
 """
     module XAMErrors
@@ -343,6 +356,9 @@ struct HasEq end
 
 const CTX = Automa.CodeGenContext(; generator = :goto, clean = true)
 
+# The latest version of the SAM specification, used e.g. for new @HD lines
+const LATEST_SAM_VERSION = "1.6"
+
 @static if isdefined(Base, :memoryindex)
     memory_index(x::MemoryRef) = Base.memoryindex(x)
 else
@@ -542,6 +558,7 @@ include("flags.jl")
 include("stringvec.jl")
 include("header.jl")
 include("references.jl")
+include("header_edit.jl")
 include("bamseq.jl")
 include("qualityview.jl")
 include("sam.jl")
