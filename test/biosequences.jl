@@ -47,7 +47,6 @@ using BioSequences: LongDNA, @dna_str
         # Malformed CIGAR, with an invalid operation
         r = mapped("1", "2M", "=A")
         r.data[XAM2.cigar_offset(r) + 1] |= 0x0f
-        r.cigar = XAM2.Uninit()
         @test XAM2.cigar(r) isa CIGARError
         @test seq(r) isa CIGARError
 

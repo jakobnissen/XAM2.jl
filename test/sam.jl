@@ -45,6 +45,7 @@ end
         @test quality_string(record) == "IIII"
         @test collect(aux_data(record)) == [AuxTag("NM") => 0, AuxTag("XA") => "hello world"]
         @test mapping_span(record) == 5:8
+        @test mapping_span(record, XAM2.cigar(record)) == 5:8
 
         # Missing fields
         record = try_parse_line("*\t4\t*\t0\t0\t*\t*\t0\t0\t*\t*")
@@ -93,7 +94,9 @@ end
         # So is the aux data
         record = try_parse_line(sam_line(VALID_FIELDS) * "\tbad")
         @test record isa SAMRecord
-        @test !XAM2.is_well_formed(aux_data(record))
+        @test aux_data(record) == XAMError(XAMErrors.invalid_aux_data)
+        @test !XAM2.is_well_formed(aux_data_unchecked(record))
+        @test occursin("Auxiliary: < malformed >", sprint(show, MIME"text/plain"(), record))
     end
 
     @testset "Invalid records" begin

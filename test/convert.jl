@@ -4,7 +4,7 @@
 # compared by value, since integers may be encoded with different types.
 function bam_fields(r::BAMRecord)
     fixed = Tuple(getfield(r, f) for f in fieldnames(BAMRecord) if f ∉ (:cigar, :refs, :data))
-    return (fixed, r.data[1:XAM2.aux_offset(r)], collect(aux_data(r)))
+    return (fixed, r.data[1:XAM2.aux_offset(r)], collect(aux_data(r)::XAM2.XAMAuxData.BAM.Auxiliary))
 end
 
 cigar_string(r::XAMRecord) = String(MemoryView(CIGAR(XAM2.cigar(r))))

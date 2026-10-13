@@ -23,7 +23,7 @@ using MemoryViews:
 
 using StringViews: StringView
 using BGZFLib: BGZFReader, BGZFWriter, BGZFError, is_data_error, virtual_position, VirtualOffset
-using CIGARStrings: CIGARStrings, AbstractCIGAR, BAMCIGAR, CIGAR, CIGARError, unsafe_switch_memory
+using CIGARStrings: CIGARStrings, AbstractCIGAR, BAMCIGAR, CIGAR, CIGARError
 using XAMAuxData: XAMAuxData, AuxTag, try_auxtag, is_well_formed
 
 using Automa: Automa, @re_str, onenter!, onexit!, onall!, rep, rep1, opt
@@ -58,6 +58,7 @@ export BAMRecord,
     quality_string,
     quality_scores,
     aux_data,
+    aux_data_unchecked,
     is_mapped,
     is_first,
     is_last,
@@ -345,8 +346,6 @@ function Base.showerror(io::IO, error::XAMError)
     return nothing
 end
 
-struct Uninit end
-
 """
     HasEq()
 
@@ -360,15 +359,6 @@ const CTX = Automa.CodeGenContext(; generator = :goto, clean = true)
 # The latest version of the SAM specification, used e.g. for new @HD lines
 const LATEST_SAM_VERSION = "1.6"
 
-@static if isdefined(Base, :memoryindex)
-    memory_index(x::MemoryRef) = Base.memoryindex(x)
-else
-    memory_index(x::MemoryRef) = Core.memoryrefoffset(x)
-end
-
-# Index in underlying memory of first index of MemoryView or Vector
-memory_index(v::Vector) = memory_index(Base.cconvert(Ptr, v))
-memory_index(m::MemoryView) = first(only(parentindices(m)))
 
 function tryparse_base10(::Type{T}, mem::ImmutableMemoryView{UInt8}) where {T <: Union{UInt8, UInt16, UInt32, UInt64}}
     isempty(mem) && return nothing
@@ -487,34 +477,6 @@ function reg2bins!(bins::Vector{UInt16}, span::UnitRange{Int32})
     end
 
     return bins
-end
-
-# This internal function _assumes_ that:
-# * If old_cigar is a AbstractCIGAR, it aliases `old_vector`
-# * old_vector == new_vector
-function copy_cigar!(
-        old_cigar::Union{Nothing, Uninit, CIGARError, XAMError, AbstractCIGAR},
-        old_vector::Vector{UInt8},
-        new_vector::Vector{UInt8},
-    )
-    if !isa(old_cigar, AbstractCIGAR)
-        return old_cigar
-    end
-    # First: Which index in `old_vector` does the backing memory of
-    # `old_cigar` start?
-    cigar_mem = MemoryView(old_cigar)
-    index_cigar_mem = memory_index(cigar_mem)
-    index_old_vec = memory_index(old_vector)
-    cigar_mem_start = index_cigar_mem - index_old_vec + 1
-
-    # Now, copy the bytes of cigar_mem into `new_vector` as those same
-    # indices
-    # TODO: Inbounds once we've tested correctness
-    dst_mem = MemoryView(new_vector)[cigar_mem_start:((cigar_mem_start + length(cigar_mem)) - 1)]
-    copy!(dst_mem, cigar_mem) # TODO: Inbounds once we've checked
-    dst_mem = ImmutableMemoryView(dst_mem)
-    new_cigar = unsafe_switch_memory(old_cigar, dst_mem)
-    return new_cigar
 end
 
 # Return `cig`, or an error if its query length differs from the sequence length.
@@ -678,9 +640,9 @@ If the record has a sequence, and the query length of the cigar differs from
 the length of the sequence, return an `XAMError` of kind
 `XAMErrors.cigar_query_length_mismatch`.
 
-This operation will validate the underlying data, and then cache
-the constructed cigar such that subsequent calls to this function
-is almost free.
+The CIGAR is not cached: Each call validates the underlying data,
+which is O(n) in the number of CIGAR operations. To use the CIGAR more than once,
+hold on to the returned value.
 
 !!! warning
     The returned `AbstractCIGAR` object aliases the record.
@@ -732,6 +694,7 @@ function get_header end
 
 """
     mapping_span(record::XAMRecord)::Union{Nothing, UnitRange{Int}, CIGARError, XAMError}
+    mapping_span(record::XAMRecord, cigar::Union{CIGAR, BAMCIGAR})::Union{Nothing, UnitRange{Int}}
 
 Return the 1-based positions in the reference that `record` is mapped to,
 or `nothing` if the position or CIGAR is not available, or the error
@@ -739,13 +702,31 @@ returned by [`cigar`](@ref) if the CIGAR is invalid.
 
 E.g. a record with CIGAR `10M100S` mapping to reference position 5
 would map to `5:14`.
+
+The one-argument method loads the CIGAR with [`cigar`](@ref), which is O(n) in the
+number of CIGAR operations. If the CIGAR of `record` has already been loaded,
+pass it as the second argument to avoid loading it again.
+The two-argument method is equivalent to:
+
+```julia
+function mapping_span(record, cigar)
+    left = left_position(record)
+    left === nothing && return nothing
+    return left:(left + CIGARStrings.ref_length(cigar) - 1)
+end
+```
 """
 function mapping_span(record::XAMRecord)::Union{Nothing, UnitRange{Int}, CIGARError, XAMError}
-    left = @something left_position(record) return nothing
+    left_position(record) === nothing && return nothing
     cig = cigar(record)
     cig === nothing && return nothing
     cig isa Union{CIGARError, XAMError} && return cig
-    return left:(left + CIGARStrings.ref_length(cig) - 1)
+    return mapping_span(record, cig)
+end
+
+function mapping_span(record::XAMRecord, cigar::Union{CIGAR, BAMCIGAR})::Union{Nothing, UnitRange{Int}}
+    left = @something left_position(record) return nothing
+    return left:(left + CIGARStrings.ref_length(cigar) - 1)
 end
 
 """

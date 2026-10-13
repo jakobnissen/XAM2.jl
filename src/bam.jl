@@ -13,8 +13,9 @@ the record. The content of variable-length fields, like the CIGAR, is validated
 when accessed. Accessors never throw on malformed data: Malformed content is returned
 as an error value, e.g. [`cigar`](@ref) returns a `CIGARError` for a malformed CIGAR.
 
-Auxiliary data is returned as an `XAMAuxData.BAM.Auxiliary`, which may throw
-when accessed if it is malformed. Use `XAMAuxData.is_well_formed` to check this first.
+Auxiliary data is returned as an `XAMAuxData.BAM.Auxiliary` by [`aux_data`](@ref),
+which returns an error if it is malformed. [`aux_data_unchecked`](@ref) skips this check,
+and the returned object may then throw when accessed.
 
     BAMRecord(refs::References)::BAMRecord
     BAMRecord(io::Union{BAMReader, BAMWriter})::BAMRecord
@@ -50,11 +51,6 @@ mutable struct BAMRecord
     # The reference IDs of the record index into these references
     const refs::References
 
-    # This field is cached. Uninit means: Not computed. Nothing means no cigar.
-    # Otherwise, a cigar or CIGARError for malformed CIGAR, or XAMError for CIGAR
-    # whose length does not match the query length.
-    cigar::Union{Uninit, Nothing, BAMCIGAR, CIGARError, XAMError}
-
     # Fixed-length fields (see BAM specs for the details), in the same layout as in BAM,
     # such that they can be copied with `memcpy`.
     # The block size field that precedes them in BAM is not stored, see `block_size`.
@@ -79,7 +75,7 @@ mutable struct BAMRecord
     tlen::Int32
 
     global function new_uninitialized_record(refs::References, data::Vector{UInt8})
-        return new(data, refs, Uninit())
+        return new(data, refs)
     end
 end
 
@@ -186,10 +182,12 @@ function Base.show(io::IO, ::MIME"text/plain", record::BAMRecord)
 
     # Auxiliary data
     aux = aux_data(record)
-    if !isempty(aux)
+    if aux isa XAMError
+        println(buf, "  Auxiliary: < malformed >")
+    elseif !isempty(aux)
         println(buf, "  Auxiliary:")
         auxbuf = IOBuffer()
-        show(auxbuf, MIME"text/plain"(), aux_data(record))
+        show(auxbuf, MIME"text/plain"(), aux)
         seekstart(auxbuf)
         readline(auxbuf)
         for line in eachline(auxbuf)
@@ -296,7 +294,7 @@ end
 get_header(reader::BAMReader) = reader.header
 references(reader::BAMReader) = reader.refs
 
-const FIXED_BAM_OFFSET = fieldoffset(BAMRecord, 4)
+const FIXED_BAM_OFFSET = fieldoffset(BAMRecord, 3)
 
 @assert sizeof(BAMRecord) == FIXED_BAM_OFFSET + BAM_FIXED_BYTES
 
@@ -311,7 +309,6 @@ function reset!(record::BAMRecord)
     resize!(record.data, 2)
     @inbounds record.data[1] = UInt8('*')
     @inbounds record.data[2] = 0x00
-    record.cigar = Uninit()
     return reset_fixed_fields!(record)
 end
 
@@ -338,8 +335,7 @@ end
 end
 
 function Base.copy(record::BAMRecord)
-    vector_copy = copy(record.data)
-    cp = new_uninitialized_record(record.refs, vector_copy)
+    cp = new_uninitialized_record(record.refs, copy(record.data))
     GC.@preserve cp record begin
         dst = Ptr{UInt8}(pointer_from_objref(cp)) + FIXED_BAM_OFFSET
         src = Ptr{UInt8}(pointer_from_objref(record)) + FIXED_BAM_OFFSET
@@ -349,7 +345,6 @@ function Base.copy(record::BAMRecord)
             (BAM_FIXED_BYTES % UInt)::Csize_t,
         )::Cvoid
     end
-    cp.cigar = copy_cigar!(record.cigar, record.data, vector_copy)
     return cp
 end
 
@@ -745,19 +740,42 @@ function quality_string(record::BAMRecord)::Union{Nothing, StringView{QualityVie
 end
 
 """
-    aux_data(record::BAMRecord)::XAMAuxData.BAM.MutableAuxiliary
+    aux_data(record::BAMRecord)::Union{XAMAuxData.BAM.MutableAuxiliary, XAMError}
 
-Return the auxiliary data as a mutable `XAMAuxData.BAM.Auxiliary`.
-If the record does not contain any auxiliary fields, the returned object
-is empty.
+Return the auxiliary data as a mutable `XAMAuxData.BAM.Auxiliary`, or an `XAMError`
+of kind `XAMErrors.invalid_aux_data` if it is malformed, i.e. if the tags or the
+boundaries of the fields can't be found.
+If the record does not contain any auxiliary fields, the returned object is empty.
+
+This checks the structure of all fields, which is O(n) in the size of the auxiliary data.
+The values are not validated: Loading an invalid value (e.g. a non-numeric integer) returns
+an `XAMAuxData.Error`. Check all values with `isvalid`.
+To skip the check, see [`aux_data_unchecked`](@ref).
 
 !!! warning
     The returned `Auxiliary` object aliases the record.
-    Mutating the record will invalidate the auxiiary data.
+    Mutating the record will invalidate the auxiliary data.
 
 See the documentation of `XAMAuxData.BAM.Auxiliary` for more details.
 """
-function aux_data(record::BAMRecord)
+function aux_data(record::BAMRecord)::Union{XAMAuxData.BAM.MutableAuxiliary, XAMError}
+    aux = aux_data_unchecked(record)
+    return is_well_formed(aux) ? aux : XAMError(XAMErrors.invalid_aux_data)
+end
+
+"""
+    aux_data_unchecked(record::BAMRecord)::XAMAuxData.BAM.MutableAuxiliary
+
+Like [`aux_data`](@ref), but without checking that the auxiliary data is well-formed.
+This avoids scanning all fields, e.g. when only a few fields are accessed.
+If the auxiliary data is malformed, iterating it or loading values may throw an
+exception, or return wrong values. Check with `XAMAuxData.is_well_formed`.
+
+!!! warning
+    The returned `Auxiliary` object aliases the record.
+    Mutating the record will invalidate the auxiliary data.
+"""
+function aux_data_unchecked(record::BAMRecord)::XAMAuxData.BAM.MutableAuxiliary
     return XAMAuxData.BAM.Auxiliary(record.data, aux_offset(record) + 1)
 end
 
@@ -787,17 +805,10 @@ function template_length(record::BAMRecord)::Union{Int, Nothing}
 end
 
 function cigar(record::BAMRecord)::Union{Nothing, BAMCIGAR, CIGARError, XAMError}
-    record.cigar === Uninit() || return record.cigar
-    encoding = get_cigar_encoding(record)
-    if encoding === nothing
-        record.cigar = nothing
-        return nothing
-    end
+    encoding = @something get_cigar_encoding(record) return nothing
     cig = CIGARStrings.try_parse(BAMCIGAR, encoding)
-    if !isa(cig, CIGARError)
-        cig = check_query_length(cig, record.l_seq % Int)
-    end
-    return record.cigar = cig
+    cig isa CIGARError && return cig
+    return check_query_length(cig, record.l_seq % Int)
 end
 
 # CIGARs with more than 65535 operations are stored in the CG auxiliary tag,
@@ -827,8 +838,7 @@ end
         placeholder::ImmutableMemoryView{UInt8},
     )::ImmutableMemoryView{UInt8}
     aux = aux_data(x)
-    # Accessing malformed aux data may throw, so we check first.
-    is_well_formed(aux) || return placeholder
+    aux isa XAMError && return placeholder
     v = get(aux, "CG", nothing)
     return v isa AbstractVector{UInt32} ? parent(v) : placeholder
 end
@@ -874,7 +884,6 @@ function try_read!(x::BAMReader)::Union{BAMRecord, Nothing, XAMError}
     offset = virtual_position(x.reader)
 
     record = x.record
-    record.cigar = Uninit()
 
     # Read the block size, and the fixed-length fields into the record
     memview = fill_bytes_to_data!(x, 4 + BAM_FIXED_BYTES)
@@ -1208,12 +1217,17 @@ function try_copy_kind!(dst::BAMRecord, src::SAMRecord)::Union{BAMRecord, XAMErr
     # Check what can fail before modifying `dst`
     ref_id = sam_reference_id(dst.refs, reference_name(src))
     ref_id isa XAMErrorKind && return ref_id
-    next_ref_id = sam_reference_id(dst.refs, next_reference_name(src))
+    next_ref_id = if is_rnext_equal(src)
+        ref_id
+    else
+        sam_reference_id(dst.refs, next_reference_name(src))
+    end
     next_ref_id isa XAMErrorKind && return next_ref_id
     cig = cigar(src)
     cig isa CIGARError && return XAMErrors.invalid_cigar
     cig isa XAMError && return cig
-    src_aux = aux_data(src)
+    # `isvalid` also checks that the auxiliary data is well-formed
+    src_aux = aux_data_unchecked(src)
     # Copying invalid auxiliary data throws
     isvalid(src_aux) || return XAMErrors.invalid_aux_data
 
@@ -1254,8 +1268,6 @@ function try_copy_kind!(dst::BAMRecord, src::SAMRecord)::Union{BAMRecord, XAMErr
         beg = dst.pos % UInt64
         reg2bin(beg, beg + (max(ref_len, 1) % UInt64))
     end
-    # The CIGAR is not cached, because it would alias `data`, which is resized below
-    dst.cigar = Uninit()
 
     # Variable-length fields, except auxiliary data
     l_read_name = (src.qname_len % Int) + 1
@@ -1391,14 +1403,13 @@ function try_copy_kind!(dst::SAMRecord, src::BAMRecord)::Union{SAMRecord, XAMErr
     cig = cigar(src)
     cig isa CIGARError && return XAMErrors.invalid_cigar
     cig isa XAMError && return cig
-    src_aux = aux_data(src)
+    # `isvalid` also checks that the auxiliary data is well-formed
+    src_aux = aux_data_unchecked(src)
     # Copying invalid auxiliary data throws
     isvalid(src_aux) || return XAMErrors.invalid_aux_data
 
     data = dst.data
     empty!(data)
-    # The CIGAR is not cached, because it would alias `data`, which is resized below
-    dst.cigar = Uninit()
 
     # QNAME
     n = append_optional_string_field!(data, query_name(src))

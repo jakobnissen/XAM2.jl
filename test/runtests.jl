@@ -110,6 +110,7 @@ end
     ]
     @test map(is_mapped, records) == [true, true, true, true, true, false]
     @test map(mapping_span, records) == [5:8, 20:22, 100:102, 50:54, 10:15, nothing]
+    @test mapping_span(records[2], XAM2.cigar(records[2])) == 20:22
     @test map(r -> String(MemoryView(CIGAR(XAM2.cigar(r)))), records[1:5]) == ["4M", "2M1I1M", "3M2S", "5M", "3M1D2M"]
     @test XAM2.cigar(records[6]) === nothing
     @test map(reference_length, records) == [1000, 1000, 1000, 500, 2000, nothing]
@@ -131,7 +132,7 @@ end
     @test String(aux_data(records[5])["XA"]) == "hello"
     @test isempty(aux_data(records[2]))
 
-    # Copying a record with a cached CIGAR gives an independent copy
+    # Copying a record gives an independent copy
     original = records[2]
     @test XAM2.cigar(original) isa XAM2.BAMCIGAR
     cp = copy(original)

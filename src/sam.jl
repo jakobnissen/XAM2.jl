@@ -142,7 +142,6 @@ mutable struct SAMRecord
 
     # Data contains the unmodified input line.
     data::Vector{UInt8}
-    cigar::Union{Uninit, Nothing, CIGAR, CIGARError, XAMError}
 
     # Inclusive start and stop indices of RNAME and RNEXT in `data`
     rname_span::Tuple{UInt32, UInt32}
@@ -161,7 +160,7 @@ mutable struct SAMRecord
     qname_len::UInt8
 
     global function new_uninitialized_sam_record(v::Vector{UInt8})
-        return new(v, Uninit())
+        return new(v)
     end
 end
 
@@ -187,7 +186,6 @@ function try_parse!(record::SAMRecord, data::ImmutableMemoryView{UInt8})::Union{
         XAMError(XAMErrors.line_too_long)
     else
         copyto!(resize!(record.data, length(data)), data)
-        record.cigar = Uninit()
         parse_sam_fields!(record, data)
     end
     if err === nothing
@@ -326,7 +324,7 @@ const SAM_RECORD_CONTENT = [
 ] |> Tuple
 
 
-const FIXED_SAM_OFFSET = fieldoffset(SAMRecord, 3)
+const FIXED_SAM_OFFSET = fieldoffset(SAMRecord, 2)
 const FIXED_SAM_SIZE = 48
 
 @assert sizeof(SAMRecord) == FIXED_SAM_SIZE + FIXED_SAM_OFFSET
@@ -353,19 +351,16 @@ function reset!(record::SAMRecord)
     for i in 1:length(DEFAULT_SAM_DATA_CONTENT)
         @inbounds data[i] = @inbounds(DEFAULT_SAM_DATA_CONTENT[i])
     end
-    record.cigar = Uninit()
     return reset_fixed_fields!(record)
 end
 
 function Base.copy(record::SAMRecord)
-    vector_copy = copy(record.data)
-    new = new_uninitialized_sam_record(vector_copy)
+    new = new_uninitialized_sam_record(copy(record.data))
     GC.@preserve record new begin
         dst = Ptr{UInt8}(pointer_from_objref(new)) + FIXED_SAM_OFFSET
         src = Ptr{UInt8}(pointer_from_objref(record)) + FIXED_SAM_OFFSET
         @ccall memcpy(dst::Ptr{UInt8}, src::Ptr{UInt8}, Csize_t(FIXED_SAM_SIZE)::Csize_t)::Cvoid
     end
-    new.cigar = copy_cigar!(record.cigar, record.data, vector_copy)
     return new
 end
 
@@ -451,10 +446,12 @@ function Base.show(io::IO, ::MIME"text/plain", record::SAMRecord)
 
     # Auxiliary data
     aux = aux_data(record)
-    if !isempty(aux)
+    if aux isa XAMError
+        println(buf, "  Auxiliary: < malformed >")
+    elseif !isempty(aux)
         println(buf, "  Auxiliary:")
         auxbuf = IOBuffer()
-        show(auxbuf, MIME"text/plain"(), aux_data(record))
+        show(auxbuf, MIME"text/plain"(), aux)
         seekstart(auxbuf)
         readline(auxbuf)
         for line in eachline(auxbuf)
@@ -479,30 +476,25 @@ function reference_name(record::SAMRecord)::Union{Nothing, AbstractString}
 end
 
 function cigar(record::SAMRecord)::Union{Nothing, CIGAR, CIGARError, XAMError}
-    record.cigar === Uninit() || return record.cigar
     view = cigar_view(record)
-    if is_missing(view)
-        record.cigar = nothing
-        return nothing
-    end
+    is_missing(view) && return nothing
     cig = CIGARStrings.try_parse(CIGAR, view)
-    if !isa(cig, CIGARError)
-        seq = sequence(record)
-        seq_len = seq === nothing ? 0 : ncodeunits(seq)
-        cig = check_query_length(cig, seq_len)
-    end
-    return record.cigar = cig
+    cig isa CIGARError && return cig
+    seq = sequence(record)
+    seq_len = seq === nothing ? 0 : ncodeunits(seq)
+    return check_query_length(cig, seq_len)
 end
 
 function next_reference_name(record::SAMRecord)::Union{Nothing, AbstractString}
+    is_rnext_equal(record) && return reference_name(record)
     view = span_view(record, record.rnext_span)
-    return if is_missing(view)
-        nothing
-    elseif length(view) == 1 && @inbounds view[1] == UInt8('=')
-        reference_name(record)
-    else
-        StringView(view)
-    end
+    return is_missing(view) ? nothing : StringView(view)
+end
+
+# Whether RNEXT is `=`, i.e. the same as RNAME
+function is_rnext_equal(record::SAMRecord)::Bool
+    view = span_view(record, record.rnext_span)
+    return length(view) == 1 && @inbounds view[1] == UInt8('=')
 end
 
 """
@@ -559,19 +551,42 @@ function quality_scores(record::SAMRecord)::Union{Nothing, QualityView}
 end
 
 """
-    aux_data(record::SAMRecord)::XAMAuxData.SAM.MutableAuxiliary
+    aux_data(record::SAMRecord)::Union{XAMAuxData.SAM.MutableAuxiliary, XAMError}
 
-Return the auxiliary data as a mutable `XAMAuxData.SAM.Auxiliary`.
-If the record does not contain any auxiliary fields, the returned object
-is empty.
+Return the auxiliary data as a mutable `XAMAuxData.SAM.Auxiliary`, or an `XAMError`
+of kind `XAMErrors.invalid_aux_data` if it is malformed, i.e. if the tags or the
+boundaries of the fields can't be found.
+If the record does not contain any auxiliary fields, the returned object is empty.
+
+This checks the structure of all fields, which is O(n) in the size of the auxiliary data.
+The values are not validated: Loading an invalid value (e.g. a non-numeric integer) returns
+an `XAMAuxData.Error`. Check all values with `isvalid`.
+To skip the check, see [`aux_data_unchecked`](@ref).
 
 !!! warning
     The returned `Auxiliary` object aliases the record.
-    Mutating the record will invalidate the auxiiary data.
+    Mutating the record will invalidate the auxiliary data.
 
 See the documentation of `XAMAuxData.SAM.Auxiliary` for more details.
 """
-function aux_data(record::SAMRecord)
+function aux_data(record::SAMRecord)::Union{XAMAuxData.SAM.MutableAuxiliary, XAMError}
+    aux = aux_data_unchecked(record)
+    return is_well_formed(aux) ? aux : XAMError(XAMErrors.invalid_aux_data)
+end
+
+"""
+    aux_data_unchecked(record::SAMRecord)::XAMAuxData.SAM.MutableAuxiliary
+
+Like [`aux_data`](@ref), but without checking that the auxiliary data is well-formed.
+This avoids scanning all fields, e.g. when only a few fields are accessed.
+If the auxiliary data is malformed, iterating it or loading values may throw an
+exception, or return wrong values. Check with `XAMAuxData.is_well_formed`.
+
+!!! warning
+    The returned `Auxiliary` object aliases the record.
+    Mutating the record will invalidate the auxiliary data.
+"""
+function aux_data_unchecked(record::SAMRecord)::XAMAuxData.SAM.MutableAuxiliary
     # If there is no auxiliary data, `aux_offset + 1` is `length(data) + 2`
     start = min((record.aux_offset % Int) + 1, length(record.data) + 1)
     return XAMAuxData.SAM.Auxiliary(record.data, start)
@@ -597,7 +612,7 @@ end
 
 """
     mutable struct SAMReader{T <: AbstractBufReader}
-    
+
 Lazy reader of SAM files.
 
 `rdr = SAMReader` is an iterator over `SAMRecord`.
@@ -618,13 +633,12 @@ If `copy` is `false`, every record returned by iterating the reader or from
 `XAM2.try_read!` will be the same record, overwritten in-place. This improves
 efficiency, but new records will invalidate every previous one.
 To prevent aliasing, `copy` can be called manually on records.
-
-`io` may be any `AbstractBufReader`, including one that can't expand its buffer to
-hold an entire line, such as a `BGZFReader` reading bgzipped SAM.
 """
 mutable struct SAMReader{T <: AbstractBufReader}
     # Wrapping the reader lets us buffer whole lines, even if the inner reader can't.
     # If the inner reader can expand its buffer, the `ExpandReader` forwards it.
+    # TODO: BufReader is the most common T, and does not require ExpandReader. If computed
+    # field types land in Julia, make this field T when T is BufReader, else ExpandReader{T}.
     const reader::ExpandReader{T}
     const record::SAMRecord
     const header::SAMHeader
