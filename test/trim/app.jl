@@ -17,6 +17,7 @@ using XAM2:
     reference_name,
     next_reference_name,
     mapping_span,
+    mapping_blocks,
     try_write
 
 function summarize(reader::Union{BAMReader, SAMReader})
@@ -32,6 +33,12 @@ function summarize(reader::Union{BAMReader, SAMReader})
         push!(names, rnext === nothing ? "*" : String(rnext))
         span = mapping_span(record)
         push!(names, span isa UnitRange{Int} ? string(span) : "*")
+        blocks = mapping_blocks(record)
+        if blocks isa XAM2.MappingBlocks
+            for block in blocks
+                push!(names, string(block))
+            end
+        end
     end
     return (n_records, names)
 end

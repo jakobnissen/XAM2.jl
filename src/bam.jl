@@ -11,7 +11,7 @@ Records read from a `BAMReader` share the reader's `References`.
 e.g. that its reference IDs and positions are in bounds, and that its fields fit in
 the record. The content of variable-length fields, like the CIGAR, is validated
 when accessed. Accessors never throw on malformed data: Malformed content is returned
-as an error value, e.g. [`cigar`](@ref) returns a `CIGARError` for a malformed CIGAR.
+as an `XAMError`, e.g. by [`cigar`](@ref) for a malformed CIGAR.
 
 Auxiliary data is returned as an `XAMAuxData.BAM.Auxiliary` by [`aux_data`](@ref),
 which returns an error if it is malformed. [`aux_data_unchecked`](@ref) skips this check,
@@ -173,7 +173,7 @@ function Base.show(io::IO, ::MIME"text/plain", record::BAMRecord)
     cig = cigar(record)
     if cig === nothing
         println(buf, "< missing >")
-    elseif cig isa Union{CIGARError, XAMError}
+    elseif cig isa XAMError
         println(buf, "< malformed CIGAR >")
     else
         str = String(MemoryView(CIGAR(cig)))
@@ -804,10 +804,10 @@ function template_length(record::BAMRecord)::Union{Int, Nothing}
     return iszero(record.tlen) ? nothing : record.tlen % Int
 end
 
-function cigar(record::BAMRecord)::Union{Nothing, BAMCIGAR, CIGARError, XAMError}
+function cigar(record::BAMRecord)::Union{Nothing, BAMCIGAR, XAMError}
     encoding = @something get_cigar_encoding(record) return nothing
     cig = CIGARStrings.try_parse(BAMCIGAR, encoding)
-    cig isa CIGARError && return cig
+    cig isa CIGARError && return XAMError(cig)
     return check_query_length(cig, record.l_seq % Int)
 end
 
@@ -1224,7 +1224,6 @@ function try_copy_kind!(dst::BAMRecord, src::SAMRecord)::Union{BAMRecord, XAMErr
     end
     next_ref_id isa XAMErrorKind && return next_ref_id
     cig = cigar(src)
-    cig isa CIGARError && return XAMErrors.invalid_cigar
     cig isa XAMError && return cig
     # `isvalid` also checks that the auxiliary data is well-formed
     src_aux = aux_data_unchecked(src)
@@ -1401,7 +1400,6 @@ end
 function try_copy_kind!(dst::SAMRecord, src::BAMRecord)::Union{SAMRecord, XAMError, XAMErrorKind}
     # Check what can fail before modifying `dst`
     cig = cigar(src)
-    cig isa CIGARError && return XAMErrors.invalid_cigar
     cig isa XAMError && return cig
     # `isvalid` also checks that the auxiliary data is well-formed
     src_aux = aux_data_unchecked(src)

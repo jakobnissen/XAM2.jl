@@ -2,10 +2,14 @@
 # Path sources of XAM2 are not used transitively, so they are repeated here.
 [deps]
 BGZFLib = "b86bd9b6-aa64-492d-a0e2-e61a004d8aed"
+BufferIO = "ff366017-094f-4144-bd70-a828a0d67152"
+CIGARStrings = "e5b51f81-6ffd-4e20-bbec-f118e37ea906"
 XAM2 = "648a2d38-8fdb-4170-a152-848d525b0756"
 XAMAuxData = "e99d641e-1821-45d7-9150-ecb7bf333fe1"
 
 [sources]
 BGZFLib = {path = "../../../BGZFLib.jl"}
+BufferIO = {path = "../../../BufferIO.jl"}
+CIGARStrings = {path = "../../../CIGARStrings.jl"}
 XAM2 = {path = "../.."}
 XAMAuxData = {path = "../../../XAMAuxData.jl"}

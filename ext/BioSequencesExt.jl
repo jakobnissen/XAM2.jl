@@ -13,7 +13,7 @@ using XAM2: XAM2,
     first_eq_seq_pos,
     seq_offset
 
-using CIGARStrings: CIGARStrings, CIGARError, pos_to_pos, query, ref, ref_length
+using CIGARStrings: CIGARStrings, pos_to_pos, query, ref, ref_length
 
 function XAM2.try_sequence(
         ::Type{LongDNA{4}},
@@ -29,7 +29,7 @@ end
         ::Type{LongDNA{4}},
         record::BAMRecord,
         reference::BioSequence{<:DNAAlphabet}
-    )::Union{Nothing, LongDNA{4}, CIGARError, XAMError}
+    )::Union{Nothing, LongDNA{4}, XAMError}
 
 Return the read sequence of `record` as a `LongDNA{4}` biosequence, where `reference`
 is the sequence of the record's reference.
@@ -43,7 +43,7 @@ Return `nothing` if:
 * The sequence contains `=`, and the record has no reference, position or CIGAR
 
 Return an error value if the sequence contains `=`, and:
-* The CIGAR is malformed: Return the `CIGARError` or `XAMError` from [`XAM2.cigar`](@ref)
+* The CIGAR is malformed: Return the `XAMError` from [`XAM2.cigar`](@ref)
 * The alignment extends past the end of `reference`: Return an `XAMError` of kind
   `XAMErrors.invalid_position`
 * A `=` is not aligned to a reference base, e.g. it is soft clipped or inserted:
@@ -56,7 +56,7 @@ function XAM2.sequence(
         ::Type{LongDNA{4}},
         record::BAMRecord,
         reference::BioSequence{<:DNAAlphabet}
-    )::Union{Nothing, LongDNA{4}, CIGARError, XAMError}
+    )::Union{Nothing, LongDNA{4}, XAMError}
     iszero(record.l_seq) && return nothing
     seq = get_seq(record)
     eq_pos = @something first_eq_seq_pos(record) return seq
@@ -64,7 +64,7 @@ function XAM2.sequence(
     length(reference) == reflen || throw(ArgumentError("Given reference has wrong length"))
     left = @something left_position(record) return nothing
     cig = @something cigar(record) return nothing
-    cig isa Union{CIGARError, XAMError} && return cig
+    cig isa XAMError && return cig
     # The alignment's end is not validated when reading
     if left + ref_length(cig) - 1 > length(reference)
         return XAMError(XAMErrors.invalid_position)

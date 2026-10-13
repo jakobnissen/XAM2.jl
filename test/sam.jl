@@ -46,6 +46,14 @@ end
         @test collect(aux_data(record)) == [AuxTag("NM") => 0, AuxTag("XA") => "hello world"]
         @test mapping_span(record) == 5:8
         @test mapping_span(record, XAM2.cigar(record)) == 5:8
+        @test collect(mapping_blocks(record)) == [5:8]
+
+        # Spliced record with a deletion
+        record = try_parse_line(with_field(6, "1S1M1D1M5N1M"))
+        @test collect(mapping_blocks(record)) == [5:7, 13:13]
+        @test collect(mapping_blocks(record, XAM2.cigar(record))) == [5:7, 13:13]
+        @test collect(mapping_blocks(record, XAM2.cigar(record), CIGARStrings.query)) == [5:5, 7:7, 13:13]
+        @test mapping_blocks(try_parse_line(with_field(4, "0"))) === nothing
 
         # Missing fields
         record = try_parse_line("*\t4\t*\t0\t0\t*\t*\t0\t0\t*\t*")
@@ -88,7 +96,13 @@ end
         @test XAM2.cigar(record) == XAMError(XAMErrors.cigar_query_length_mismatch)
         @test mapping_span(record) == XAMError(XAMErrors.cigar_query_length_mismatch)
         record = try_parse_line(with_field(6, "0M4I"))
-        @test XAM2.cigar(record) isa CIGARError
+        err = XAM2.cigar(record)
+        @test err isa XAMError
+        @test err.kind == XAMErrors.invalid_cigar
+        @test err.wrapped_error == CIGARError(2, CIGARStrings.Errors.ZeroLength)
+        @test mapping_span(record) == err
+        @test mapping_blocks(record) == err
+        @test occursin("in CIGAR", sprint(showerror, err))
         @test sprint(show, MIME"text/plain"(), record) isa String
 
         # So is the aux data

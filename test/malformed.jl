@@ -181,7 +181,7 @@ end
             io = IOBuffer(b"not a BAM file")
             err = XAM2.try_init(BAMReader, io; n_workers = 1)
             @test err.kind == XAMErrors.bgzf_error
-            @test err.bgzf_error isa BGZFError
+            @test err.wrapped_error isa BGZFError
             @test !isopen(io)
             path = tempname(dir)
             write(path, corrupt_crc!(bgzf_compress(dir, raw_bam_header(; text = "@HD\tVN:1.6\n"))))
@@ -303,8 +303,8 @@ end
                 @test query_name(XAM2.try_read!(reader)) == "rec1"
                 err = XAM2.try_read!(reader)
                 @test err.kind == XAMErrors.bgzf_error
-                @test err.bgzf_error isa BGZFError
-                @test err.bgzf_error.file_offset == length(first_stream)
+                @test err.wrapped_error isa BGZFError
+                @test err.wrapped_error.file_offset == length(first_stream)
                 @test err.offset == VirtualOffset(length(first_stream), 0)
                 @test startswith(sprint(showerror, err), "XAMError: malformed BGZF compression (BGZFError: ")
                 # Sticky
@@ -343,8 +343,8 @@ end
             # Invalid CIGAR op: Accessors return the error, and don't throw
             record = read_first(dir, raw_record(refID = Int32(0), pos = Int32(0), cigar = UInt32[(4 << 4) | 9], seq = [0x12, 0x48], qual = fill(0x1e, 4)))
             @test record isa BAMRecord
-            @test XAM2.cigar(record) isa CIGARError
-            @test mapping_span(record) isa CIGARError
+            @test XAM2.cigar(record).wrapped_error isa CIGARError
+            @test error_kind(mapping_span(record)) == XAMErrors.invalid_cigar
             @test sprint(show, MIME"text/plain"(), record) isa String
 
             # CIGAR query length must match the sequence length

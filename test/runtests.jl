@@ -3,7 +3,7 @@ using XAM2
 using XAM2: XAMErrors, Reference, try_write, try_parse_header, seek_first_record
 using BGZFLib: BGZFReader, BGZFWriter, BGZFError, VirtualOffset
 using MemoryViews: ImmutableMemoryView, MemoryView
-using CIGARStrings: CIGAR, CIGARError
+using CIGARStrings: CIGARStrings, CIGAR, CIGARError
 using XAM2: AuxTag
 
 const DATADIR = joinpath(@__DIR__, "data")

@@ -63,6 +63,7 @@ export BAMRecord,
     is_first,
     is_last,
     mapping_span,
+    mapping_blocks,
     XAMError,
     XAMErrorKind,
     XAMErrors
@@ -78,6 +79,7 @@ public try_parse!,
     Reference,
     reference,
     try_parse_header,
+    MappingBlocks,
     try_validate,
     HasEq,
     AbstractHeader,
@@ -191,8 +193,13 @@ An `XAMError` has the following public properties:
 * `offset::Union{Nothing, VirtualOffset}`: For BAM records, the BGZF virtual offset
   of the start of the record. Seeking a `BAMReader` to this offset and reading
   reproduces the error.
-* `bgzf_error::Union{Nothing, BGZFLib.BGZFError}`: For errors of kind
-  `XAMErrors.bgzf_error`, the error from decompressing the malformed BGZF data.
+* `wrapped_error::Union{Nothing, BGZFLib.BGZFError, CIGARStrings.CIGARError}`:
+  The error from another package which caused this error, if any:
+  - For errors of kind `XAMErrors.bgzf_error`, the `BGZFError` from decompressing
+    the malformed BGZF data.
+  - For errors of kind `XAMErrors.invalid_cigar` returned by [`cigar`](@ref),
+    the `CIGARError` from parsing the CIGAR. Its `index` is relative to the start
+    of the CIGAR.
 
 The location properties are `nothing` if not applicable or not known.
 SAM records have `record`, `line` and `column`; text headers of SAM and BAM files have
@@ -200,7 +207,7 @@ SAM records have `record`, `line` and `column`; text headers of SAM and BAM file
 
     XAMError(
         kind::XAMErrorKind;
-        record=nothing, line=nothing, column=nothing, offset=nothing, bgzf_error=nothing,
+        record=nothing, line=nothing, column=nothing, offset=nothing, wrapped_error=nothing,
     )
 """
 struct XAMError <: Exception
@@ -209,7 +216,7 @@ struct XAMError <: Exception
     line::Union{Nothing, Int}
     column::Union{Nothing, Int}
     offset::Union{Nothing, VirtualOffset}
-    bgzf_error::Union{Nothing, BGZFError}
+    wrapped_error::Union{Nothing, BGZFError, CIGARError}
 end
 
 function XAMError(
@@ -218,12 +225,13 @@ function XAMError(
         line::Union{Nothing, Int} = nothing,
         column::Union{Nothing, Int} = nothing,
         offset::Union{Nothing, VirtualOffset} = nothing,
-        bgzf_error::Union{Nothing, BGZFError} = nothing,
+        wrapped_error::Union{Nothing, BGZFError, CIGARError} = nothing,
     )
-    return XAMError(kind, record, line, column, offset, bgzf_error)
+    return XAMError(kind, record, line, column, offset, wrapped_error)
 end
 
-XAMError(e::BGZFError; offset::Union{Nothing, VirtualOffset} = nothing) = XAMError(XAMErrors.bgzf_error; offset, bgzf_error = e)
+XAMError(e::BGZFError; offset::Union{Nothing, VirtualOffset} = nothing) = XAMError(XAMErrors.bgzf_error; offset, wrapped_error = e)
+XAMError(e::CIGARError) = XAMError(XAMErrors.invalid_cigar; wrapped_error = e)
 
 
 function error_message(kind::XAMErrorKind)::String
@@ -327,10 +335,11 @@ end
 
 function Base.showerror(io::IO, error::XAMError)
     print(io, "XAMError: ", error_message(error.kind))
-    bgzf_error = error.bgzf_error
-    if bgzf_error !== nothing
+    wrapped_error = error.wrapped_error
+    if wrapped_error !== nothing
         print(io, " (")
-        showerror(io, bgzf_error)
+        showerror(io, wrapped_error)
+        wrapped_error isa CIGARError && print(io, " in CIGAR")
         print(io, ')')
     end
     is_first = true
@@ -630,12 +639,13 @@ and negative for the rightmost.
 function template_length end
 
 """
-    cigar(record::SAMRecord)::Union{Nothing, CIGAR, CIGARError, XAMError}
-    cigar(record::BAMRecord)::Union{Nothing, BAMCIGAR, CIGARError, XAMError}
+    cigar(record::SAMRecord)::Union{Nothing, CIGAR, XAMError}
+    cigar(record::BAMRecord)::Union{Nothing, BAMCIGAR, XAMError}
 
 Get the `cigar` of `record` as a `CIGARStrings.CIGAR` or
 `CIGARStrings.BAMCIGAR`, or return `nothing` if the data is not available,
-or a `CIGARStrings.CIGARError` if the cigar is malformed.
+or an `XAMError` of kind `XAMErrors.invalid_cigar` if the cigar is malformed,
+with the `CIGARStrings.CIGARError` stored in its `wrapped_error` property.
 If the record has a sequence, and the query length of the cigar differs from
 the length of the sequence, return an `XAMError` of kind
 `XAMErrors.cigar_query_length_mismatch`.
@@ -693,7 +703,7 @@ This can not happen if the reader was constructed with `strict_header = true`.
 function get_header end
 
 """
-    mapping_span(record::XAMRecord)::Union{Nothing, UnitRange{Int}, CIGARError, XAMError}
+    mapping_span(record::XAMRecord)::Union{Nothing, UnitRange{Int}, XAMError}
     mapping_span(record::XAMRecord, cigar::Union{CIGAR, BAMCIGAR})::Union{Nothing, UnitRange{Int}}
 
 Return the 1-based positions in the reference that `record` is mapped to,
@@ -716,17 +726,81 @@ function mapping_span(record, cigar)
 end
 ```
 """
-function mapping_span(record::XAMRecord)::Union{Nothing, UnitRange{Int}, CIGARError, XAMError}
+function mapping_span(record::XAMRecord)::Union{Nothing, UnitRange{Int}, XAMError}
     left_position(record) === nothing && return nothing
     cig = cigar(record)
     cig === nothing && return nothing
-    cig isa Union{CIGARError, XAMError} && return cig
+    cig isa XAMError && return cig
     return mapping_span(record, cig)
 end
 
 function mapping_span(record::XAMRecord, cigar::Union{CIGAR, BAMCIGAR})::Union{Nothing, UnitRange{Int}}
     left = @something left_position(record) return nothing
     return left:(left + CIGARStrings.ref_length(cigar) - 1)
+end
+
+"""
+    MappingBlocks{C <: Union{CIGAR, BAMCIGAR}}
+
+Lazy iterator of `UnitRange{Int}` returned by [`mapping_blocks`](@ref).
+This type may be referred to in stable code, but its API is defined by
+`mapping_blocks`.
+"""
+struct MappingBlocks{C <: Union{CIGAR, BAMCIGAR}}
+    blocks::CIGARStrings.AlignedBlocks{C}
+    # Zero-based leftmost position
+    offset::Int
+end
+
+Base.IteratorSize(::Type{<:MappingBlocks}) = Base.SizeUnknown()
+Base.eltype(::Type{<:MappingBlocks}) = UnitRange{Int}
+
+function Base.iterate(x::MappingBlocks, state...)
+    (block, new_state) = @something iterate(x.blocks, state...) return nothing
+    # Blocks are never empty, so this skips the branch in the `UnitRange` constructor
+    range = reinterpret(UnitRange{Int}, (first(block) + x.offset, last(block) + x.offset))
+    return (range, new_state)
+end
+
+"""
+    mapping_blocks(record::XAMRecord)::Union{Nothing, MappingBlocks, XAMError}
+    mapping_blocks(record::XAMRecord, cigar::Union{CIGAR, BAMCIGAR}, along::CIGARStrings.Coordinate=CIGARStrings.aln)::Union{Nothing, MappingBlocks}
+
+Return a lazy, non-allocating iterator of `UnitRange{Int}` with the blocks of 1-based
+reference positions that `record` is mapped to, or `nothing` if the position or
+CIGAR is not available, or the error returned by [`cigar`](@ref) if the CIGAR is invalid.
+
+The blocks are those of `CIGARStrings.aligned_blocks(CIGARStrings.ref, along, cigar)`,
+offset by the [`left_position`](@ref) of `record`. In short:
+* With `along = CIGARStrings.aln`, the default, blocks are split by `N` operations
+  (usually introns), but not by deletions. This is the same as BED12 blocks from
+  `bedtools bamtobed -split`, and is useful for computing read depth.
+* With `along = CIGARStrings.query`, blocks are split by both `N` and deletions.
+
+Unlike pysam's `get_blocks`, blocks are never split by insertions.
+The blocks lie within [`mapping_span`](@ref), and are sorted, non-empty and non-adjacent.
+
+E.g. a record with CIGAR `2M1D2M5N3M`, mapping to reference position 10,
+has the blocks `[10:14, 20:22]` along `aln`, and `[10:11, 13:14, 20:22]` along `query`.
+
+As for [`mapping_span`](@ref), pass an already loaded CIGAR as the second argument to
+avoid loading it again.
+"""
+function mapping_blocks(record::XAMRecord)::Union{Nothing, MappingBlocks, XAMError}
+    left_position(record) === nothing && return nothing
+    cig = cigar(record)
+    cig === nothing && return nothing
+    cig isa XAMError && return cig
+    return mapping_blocks(record, cig)
+end
+
+function mapping_blocks(
+        record::XAMRecord,
+        cigar::C,
+        along::CIGARStrings.Coordinate = CIGARStrings.aln,
+    )::Union{Nothing, MappingBlocks{C}} where {C <: Union{CIGAR, BAMCIGAR}}
+    left = @something left_position(record) return nothing
+    return MappingBlocks{C}(CIGARStrings.aligned_blocks(CIGARStrings.ref, along, cigar), left - 1)
 end
 
 """

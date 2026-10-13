@@ -437,7 +437,7 @@ function Base.show(io::IO, ::MIME"text/plain", record::SAMRecord)
     cig = cigar(record)
     if cig === nothing
         println(buf, "< missing >")
-    elseif cig isa Union{CIGARError, XAMError}
+    elseif cig isa XAMError
         println(buf, "< malformed CIGAR >")
     else
         str = String(MemoryView(CIGAR(cig)))
@@ -475,11 +475,11 @@ function reference_name(record::SAMRecord)::Union{Nothing, AbstractString}
     return is_missing(view) ? nothing : StringView(view)
 end
 
-function cigar(record::SAMRecord)::Union{Nothing, CIGAR, CIGARError, XAMError}
+function cigar(record::SAMRecord)::Union{Nothing, CIGAR, XAMError}
     view = cigar_view(record)
     is_missing(view) && return nothing
     cig = CIGARStrings.try_parse(CIGAR, view)
-    cig isa CIGARError && return cig
+    cig isa CIGARError && return XAMError(cig)
     seq = sequence(record)
     seq_len = seq === nothing ? 0 : ncodeunits(seq)
     return check_query_length(cig, seq_len)

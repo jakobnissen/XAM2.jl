@@ -18,6 +18,7 @@ BioSequences = "7e6ae17a-c86d-528c-b3b9-7f778a29fe59"
 [sources]
 BGZFLib = {path = "../BGZFLib.jl"}
 BufferIO = {path = "../BufferIO.jl"}
+CIGARStrings = {path = "../CIGARStrings.jl"}
 XAMAuxData = {path = "../XAMAuxData.jl"}
 
 [extensions]
