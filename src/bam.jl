@@ -508,7 +508,7 @@ function BAMReader(
 end
 
 
-function BAMReader(f::Function, args...; kwargs...)
+function BAMReader(f::Function, args::Vararg{Any, N}; kwargs...) where {N}
     reader = BAMReader(args...; kwargs...)
     return try
         f(reader)
@@ -1063,7 +1063,7 @@ function check_writer_header(header::SAMHeader, refs::References)::Nothing
     return nothing
 end
 
-function BAMWriter(f::Function, args...; kwargs...)
+function BAMWriter(f::Function, args::Vararg{Any, N}; kwargs...) where {N}
     writer = BAMWriter(args...; kwargs...)
     return try
         f(writer)

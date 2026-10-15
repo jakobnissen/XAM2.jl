@@ -699,7 +699,7 @@ function SAMReader(io::Union{IO, AbstractBufReader}; copy::Bool = true)
     return reader
 end
 
-function SAMReader(f::Function, args...; kwargs...)
+function SAMReader(f::Function, args::Vararg{Any, N}; kwargs...) where {N}
     reader = SAMReader(args...; kwargs...)
     return try
         f(reader)

@@ -60,21 +60,18 @@ function (@main)(args::Vector{String})::Cint
     header = XAM2.try_parse_header(XAM2.ImmutableMemoryView("@HD\tVN:1.6\n"))
     header isa SAMHeader || return 1
     XAM2.seek_first_record(reader)
-    writer = BAMWriter(open(out_path, "w"), header, reversed; n_workers = 1)
-    n_errors = 0
-    for record in reader
-        n_errors += try_write(writer, record) isa XAMError
+    # The do-block forms take keyword arguments, which must not prevent trimming
+    n_errors = BAMWriter(open(out_path, "w"), header, reversed; n_workers = 1) do writer
+        n = 0
+        for record in reader
+            n += try_write(writer, record) isa XAMError
+        end
+        n
     end
-    close(writer)
     close(reader)
 
-    reader = BAMReader(open(out_path); n_workers = 1)
-    (n3, names3) = summarize(reader)
-    close(reader)
-
-    reader = SAMReader(open(sam_path))
-    (n4, names4) = summarize(reader)
-    close(reader)
+    (n3, names3) = BAMReader(summarize, open(out_path); n_workers = 1)
+    (n4, names4) = SAMReader(summarize, open(sam_path))
 
     println(Core.stdout, "records: ", n1, " ", n2, " ", n3, " ", n4)
     println(Core.stdout, "write errors: ", n_errors)
