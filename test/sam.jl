@@ -271,7 +271,9 @@ end
 
     # CRLF line endings, and no trailing newline
     data = "@HD\tVN:1.6\r\n" * join(sam_lines, "\r\n")
-    @test map(summarize, SAMReader(collect, IOBuffer(data))) == map(summarize, records)
+    crlf_records = SAMReader(collect, IOBuffer(data))
+    @test map(summarize, crlf_records) == map(summarize, records)
+    @test [String(copy(r.data)) for r in crlf_records] == sam_lines
 
     # Header only, and empty file
     @test isempty(SAMReader(collect, IOBuffer("@HD\tVN:1.6\n")))

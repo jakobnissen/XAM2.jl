@@ -753,11 +753,10 @@ Base.IteratorSize(::Type{<:SAMReader}) = Base.SizeUnknown()
 Base.eltype(::Type{<:SAMReader}) = SAMRecord
 
 function Base.iterate(reader::SAMReader, _::Nothing = nothing)
-    result = try_read!(reader)
+    result = try_read_record!(reader, reader.copy)
     result === nothing && return nothing
     isa(result, XAMError) && throw(result)
-    record = reader.copy ? copy(result) : result
-    return (record, nothing)
+    return (result, nothing)
 end
 
 """
@@ -776,13 +775,24 @@ what is validated.
 This function does not throw if the reader's data is malformed.
 """
 function try_read!(reader::SAMReader)::Union{SAMRecord, Nothing, XAMError}
+    return try_read_record!(reader, false)
+end
+
+# Like `try_read!`, but if `new_record` is set, parse into a new record instead of the
+# reader's record. This copies the line once, whereas copying the reader's record
+# would copy it twice.
+function try_read_record!(reader::SAMReader, new_record::Bool)::Union{SAMRecord, Nothing, XAMError}
     isnothing(reader.error) || return reader.error
     # Get a view of the current line, stripped from newline
     line_view = get_next_line_view(reader.reader)
     line_view === nothing && return nothing
     reader.n_records += 1
     line_view isa XAMErrorKind && return fail_read!(reader, XAMError(line_view))
-    result = try_parse!(reader.record, _chomp(line_view))
+    line = _chomp(line_view)
+    # `try_parse!` copies the line into the record's data, which is already the right
+    # size for a new record. On failure, the new record is discarded.
+    record = new_record ? new_uninitialized_sam_record(Vector{UInt8}(undef, length(line))) : reader.record
+    result = try_parse!(record, line)
     @inbounds consume(reader.reader, length(line_view))
     # On failure, `try_parse!` has already reset the record
     result isa XAMError && return fail_read!(reader, result)

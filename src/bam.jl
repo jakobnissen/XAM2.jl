@@ -316,11 +316,10 @@ Base.IteratorSize(::Type{<:BAMReader}) = Base.SizeUnknown()
 Base.eltype(::Type{<:BAMReader}) = BAMRecord
 
 function Base.iterate(reader::BAMReader, _::Nothing = nothing)
-    result = try_read!(reader)
+    result = try_read_record!(reader, reader.copy)
     result === nothing && return nothing
     isa(result, XAMError) && throw(result)
-    record = reader.copy ? copy(result) : result
-    return (record, nothing)
+    return (result, nothing)
 end
 
 @inline function reset_fixed_fields!(record::BAMRecord)
@@ -336,16 +335,20 @@ end
 
 function Base.copy(record::BAMRecord)
     cp = new_uninitialized_record(record.refs, copy(record.data))
-    GC.@preserve cp record begin
-        dst = Ptr{UInt8}(pointer_from_objref(cp)) + FIXED_BAM_OFFSET
-        src = Ptr{UInt8}(pointer_from_objref(record)) + FIXED_BAM_OFFSET
+    return copy_fixed_fields!(cp, record)
+end
+
+function copy_fixed_fields!(dst::BAMRecord, src::BAMRecord)
+    GC.@preserve dst src begin
+        dst_ptr = Ptr{UInt8}(pointer_from_objref(dst)) + FIXED_BAM_OFFSET
+        src_ptr = Ptr{UInt8}(pointer_from_objref(src)) + FIXED_BAM_OFFSET
         @ccall memcpy(
-            dst::Ptr{Cchar},
-            src::Ptr{Cchar},
+            dst_ptr::Ptr{Cchar},
+            src_ptr::Ptr{Cchar},
             (BAM_FIXED_BYTES % UInt)::Csize_t,
         )::Cvoid
     end
-    return cp
+    return dst
 end
 
 function seek_first_record(reader::BAMReader)
@@ -872,6 +875,13 @@ fields, e.g. the CIGAR, is validated when it is accessed.
 This function does not throw if the reader's data is malformed.
 """
 function try_read!(x::BAMReader)::Union{BAMRecord, Nothing, XAMError}
+    return try_read_record!(x, false)
+end
+
+# Like `try_read!`, but if `new_record` is set, read into a new record instead of the
+# reader's record. This copies the data once, whereas copying the reader's record
+# would copy it twice.
+function try_read_record!(x::BAMReader, new_record::Bool)::Union{BAMRecord, Nothing, XAMError}
     isnothing(x.error) || return x.error
 
     # Check if EOF and return that error if so
@@ -895,10 +905,22 @@ function try_read!(x::BAMReader)::Union{BAMRecord, Nothing, XAMError}
     err = check_fixed_fields(record, stored_block_size)
     err === nothing || return fail_read!(x, XAMError(err; offset))
 
-    # Read all the variable length fields, overwriting the fixed field bytes,
-    # which we have already moved into the integer fields of the struct
     data_len = (stored_block_size - UInt32(BAM_FIXED_BYTES)) % Int
-    memview = fill_bytes_to_data!(x, data_len)
+    if new_record
+        # Allocate after checking the fixed fields, so obviously malformed records are
+        # rejected without allocating. A malformed block size may still pass the check
+        # and allocate up to 4 GiB, but the pages are only touched as data is read.
+        new = new_uninitialized_record(x.refs, Vector{UInt8}(undef, data_len))
+        copy_fixed_fields!(new, record)
+        # The reader's record may have been returned by `try_read!`, so it must
+        # satisfy the structural invariants of `BAMRecord`.
+        reset!(record)
+        record = new
+    end
+
+    # Read all the variable length fields. For the reader's record, this overwrites the
+    # fixed field bytes, which we have already moved into the integer fields of the struct
+    memview = fill_bytes_to_data!(x.reader, record.data, data_len)
     memview isa ImmutableMemoryView || return fail_read!(x, fill_error(memview, offset))
     resize!(record.data, data_len)
     @inbounds(record.data[record.l_read_name]) == 0x00 ||
