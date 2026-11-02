@@ -173,7 +173,7 @@ end
             @test !isopen(io)
             # Also when passing a BGZFReader
             path = tempname(dir)
-            BGZFWriter(io -> write(io, b"BAM\1", le_bytes(UInt32(100))), open(path, "w"))
+            BGZFWriter(io -> write(io, [b"BAM\1"; le_bytes(UInt32(100))]), open(path, "w"))
             bgzf = BGZFReader(open(path); n_workers = 1)
             @test XAM2.try_init(BAMReader, bgzf) == XAMError(XAMErrors.header_truncated)
             @test !isopen(bgzf)

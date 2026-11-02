@@ -1060,21 +1060,39 @@ function BAMWriter(
     header_text = MemoryView(header)
 
     # Write magic bytes BAM\1
-    write(writer, htol(0x014d4142))
-    write(writer, htol(length(header_text) % UInt32))
+    write_le(writer, 0x014d4142)
+    write_le(writer, length(header_text) % UInt32)
     write(writer, header_text)
-    write(writer, htol(length(refs) % UInt32))
+    write_le(writer, length(refs) % UInt32)
 
     # Write reference sequences
     for ref in refs
         cu = codeunits(ref.name)
-        write(writer, htol((length(cu) + 1) % UInt32))
-        write(writer, cu, 0x00)
-        write(writer, htol(ref.length % UInt32))
+        write_le(writer, (length(cu) + 1) % UInt32)
+        write(writer, cu)
+        write(writer, 0x00)
+        write_le(writer, ref.length % UInt32)
     end
 
     maps = IdDict{References, Union{Nothing, Vector{Int32}}}()
     return BAMWriter{T}(writer, refs, nothing, nothing, maps)
+end
+
+# Write `x` as 4 little-endian bytes.
+function write_le(writer::AbstractBufWriter, x::UInt32)::Nothing
+    buffer = get_nonempty_buffer(writer, 4)
+    buffer === nothing && return write_le_slowpath(writer, x)
+    inbounds_store_le!(buffer, 1, x)
+    @inbounds consume(writer, 4)
+    return nothing
+end
+
+# The writer can't buffer 4 bytes at once, so write them one at a time
+@noinline function write_le_slowpath(writer::AbstractBufWriter, x::UInt32)::Nothing
+    for shift in 0:8:24
+        write(writer, (x >>> shift) % UInt8)
+    end
+    return nothing
 end
 
 function check_writer_header(header::SAMHeader, refs::References)::Nothing

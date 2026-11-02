@@ -235,6 +235,7 @@ LimitedBufReader(s::String, max_size::Int) = LimitedBufReader(collect(codeunits(
 XAM2.BufferIO.get_buffer(x::LimitedBufReader) = ImmutableMemoryView(x.data)[x.start:x.stop]
 XAM2.BufferIO.consume(x::LimitedBufReader, n::Int) = (x.start += n; nothing)
 Base.close(::LimitedBufReader) = nothing
+Base.isopen(::LimitedBufReader) = true
 
 function XAM2.BufferIO.fill_buffer(x::LimitedBufReader)::Union{Int, Nothing}
     x.stop == length(x.data) && return 0
@@ -356,7 +357,8 @@ end
                 BGZFWriter(open(path, "w")) do writer
                     write(writer, header)
                     for _ in 1:n_records
-                        write(writer, short, '\n')
+                        write(writer, short)
+                        write(writer, 0x0a)
                     end
                 end
                 records = SAMReader(collect, BGZFReader(open(path); n_workers = 1))
