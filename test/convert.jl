@@ -3,7 +3,7 @@
 # The fields of a BAM record that are stored in the BAM file. Auxiliary values are
 # compared by value, since integers may be encoded with different types.
 function bam_fields(r::BAMRecord)
-    fixed = Tuple(getfield(r, f) for f in fieldnames(BAMRecord) if f ∉ (:cigar, :refs, :data))
+    fixed = XAM2.fixed_fields(r)
     return (fixed, r.data[1:XAM2.aux_offset(r)], collect(aux_data(r)::XAM2.XAMAuxData.BAM.Auxiliary))
 end
 
@@ -24,6 +24,11 @@ end
         for (sam, bam) in zip(sam_records, bam_records)
             @test bam_fields(copy!(record, sam)) == bam_fields(bam)
         end
+        # Writing computes the same bins as samtools
+        header = SAMReader(get_header, open(EXAMPLE_SAM))
+        converted = [copy!(BAMRecord(refs), sam) for sam in sam_records]
+        written = read_bam(write_bam(mktempdir(), converted, header, refs))
+        @test [r.bin for r in written] == [r.bin for r in bam_records]
         # Missing quality is all 0xff
         r2 = copy!(record, sam_records[3])
         @test quality_scores(r2) === nothing
@@ -77,15 +82,43 @@ end
             # Beyond BAI's range, the bin is truncated, like htslib
             @test XAM2.reg2bin(T(1 << 30), T((1 << 30) + 1)) == (4681 + (1 << 16)) % UInt16
         end
+        # The bin is computed when writing, and the stored bin is ignored
+        refs = References(["chr1"], [100_000])
+        header = parse_header("@SQ\tSN:chr1\tLN:100000")
+        function written_bin(fields)
+            record = try_sam_to_bam(sam_line(fields), refs)::BAMRecord
+            record.bin = 0x1234
+            return only(read_bam(write_bam(mktempdir(), [record], header, refs))).bin
+        end
         # Unmapped record with no position
-        record = try_sam_to_bam(sam_line(["r", "4", "*", "0", "0", "*", "*", "0", "0", "A", "*"]))
-        @test record.bin == 4680
+        @test written_bin(["r", "4", "*", "0", "0", "*", "*", "0", "0", "A", "*"]) == 4680
         # Unmapped record with a position
-        record = try_sam_to_bam(sam_line(["r", "4", "chr1", "5", "0", "*", "*", "0", "0", "A", "*"]))
-        @test record.bin == XAM2.reg2bin(UInt32(4), UInt32(5))
+        @test written_bin(["r", "4", "chr1", "5", "0", "*", "*", "0", "0", "A", "*"]) == 4681
         # Zero reference length is binned as length 1
-        record = try_sam_to_bam(sam_line(["r", "0", "chr1", "1", "0", "2S", "*", "0", "0", "AC", "*"]))
-        @test record.bin == 4681
+        @test written_bin(["r", "0", "chr1", "1", "0", "2S", "*", "0", "0", "AC", "*"]) == 4681
+        # Spanning a 16 KiB boundary
+        @test written_bin(["r", "0", "chr1", "16384", "0", "2M", "*", "0", "0", "AC", "*"]) == 585
+        # Unmapped records are binned as length 1, even with a CIGAR
+        @test written_bin(["r", "4", "chr1", "16384", "0", "2M", "*", "0", "0", "AC", "*"]) == 4681
+        # The bin is not part of the record's content
+        a = try_sam_to_bam(sam_line(["r", "4", "*", "0", "0", "*", "*", "0", "0", "A", "*"]))
+        b = copy(a)
+        b.bin = 0x1234
+        @test a == b
+        @test hash(a) == hash(b)
+    end
+
+    @testset "Writing validates the CIGAR" begin
+        record = try_sam_to_bam(sam_line(["r", "0", "chr1", "1", "0", "2M", "*", "0", "0", "AC", "*"]))
+        # Make the CIGAR 3M, which doesn't match the sequence length
+        record.data[record.l_read_name + 1] = 0x30
+        @test error_kind(XAM2.cigar(record)) == XAMErrors.cigar_query_length_mismatch
+        header = parse_header("@SQ\tSN:chr1\tLN:1000\n@SQ\tSN:chr2\tLN:500")
+        io = IOBuffer()
+        BAMWriter(io, header; n_workers = 1) do writer
+            @test error_kind(try_write(writer, record)) == XAMErrors.cigar_query_length_mismatch
+            @test_throws XAMError write(writer, record)
+        end
     end
 
     @testset "CIGARs with more than 65535 operations" begin

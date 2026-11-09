@@ -62,7 +62,9 @@ mutable struct BAMRecord
     l_read_name::UInt8
     # 0xff indicates missing
     mapq::UInt8
-    # Bin index (used when indexing BAM files)
+    # Bin index, used when indexing BAM files. This is never read: It may be stale, e.g.
+    # if the record was edited, so the writer computes the bin instead, see `compute_bin`.
+    # The field is kept so the fixed-length fields have the same layout as in BAM.
     bin::UInt16
     # Number of CIGAR ops - but can be missing, see `is_missing_cigar_field`
     n_cigar_op::UInt16
@@ -346,9 +348,10 @@ function Base.copy(record::BAMRecord)
     return copy_fixed_fields!(cp, record)
 end
 
+# The fixed-length fields, except `bin`, which is not part of the record's content
 function fixed_fields(x::BAMRecord)
     return (
-        x.refID, x.pos, x.l_read_name, x.mapq, x.bin, x.n_cigar_op,
+        x.refID, x.pos, x.l_read_name, x.mapq, x.n_cigar_op,
         x.flags, x.l_seq, x.next_refID, x.next_pos, x.tlen,
     )
 end
@@ -1250,10 +1253,16 @@ end
     XAM2.try_write(writer::BAMWriter, record::BAMRecord)::Union{Int, XAMError}
 
 Write `record` to `writer`, and return the number of bytes written.
-If the record can't be represented using the references of `writer`, write nothing,
-and return an `XAMError`. This happens if the reference or next reference of
-`record` is not present in `writer`, or if it has a different length in `writer`.
+If the record can't be written, write nothing, and return an `XAMError`. This happens if:
+* The reference or next reference of `record` is not present in `writer`,
+  or has a different length in `writer`.
+* The CIGAR of `record` is malformed, or doesn't match the sequence length,
+  see [`cigar`](@ref).
 Errors from the underlying IO are thrown.
+
+The bin field, which is used for indexing, is computed from the position, CIGAR and
+flags of `record` when writing, so it is correct even if the record has been edited.
+The auxiliary data is not validated.
 
 See also: [`BAMWriter`](@ref)
 """
@@ -1263,7 +1272,26 @@ function try_write(writer::BAMWriter, record::BAMRecord)::Union{Int, XAMError}
     return result
 end
 
-function try_write_kind(writer::BAMWriter, record::BAMRecord)::Union{Int, XAMErrorKind}
+# The BAI bin of a record with 0-based position `pos` (-1 if missing), whose CIGAR spans
+# `ref_len` reference positions (0 if it has no CIGAR). Following the SAM specification,
+# section 5.3, and htslib, unmapped records, and records whose CIGAR consumes no reference
+# positions, are binned as spanning one position, and records with no position get
+# `reg2bin(-1, 0)`, which is 4680.
+function compute_bin(pos::Int32, ref_len::Int, flags::SAMFlags)::UInt16
+    pos < 0 && return UInt16(4680)
+    len = SAMFlag.UNMAP in flags ? 1 : max(ref_len, 1)
+    # As `UInt64`, since the end may not fit in 32 bits
+    beg = pos % UInt64
+    return reg2bin(beg, beg + len % UInt64)
+end
+
+function try_write_kind(writer::BAMWriter, record::BAMRecord)::Union{Int, XAMError, XAMErrorKind}
+    # The stored `bin` is not trusted, since the record may have been edited.
+    # Computing it needs the CIGAR, which is validated in the same pass.
+    cig = cigar(record)
+    cig isa XAMError && return cig
+    ref_len = cig === nothing ? 0 : CIGARStrings.ref_length(cig)
+    bin = compute_bin(record.pos, ref_len, record.flags)
     src = record.refs
     map = src === writer.refs ? nothing : reference_map!(writer, src)
     (ref_id, next_ref_id) = if map === nothing
@@ -1278,7 +1306,7 @@ function try_write_kind(writer::BAMWriter, record::BAMRecord)::Union{Int, XAMErr
         next_ref_id isa XAMErrorKind && return next_ref_id
         (ref_id, next_ref_id)
     end
-    return write_record(writer, record, ref_id, next_ref_id)
+    return write_record(writer, record, ref_id, next_ref_id, bin)
 end
 
 function Base.write(writer::BAMWriter, record::BAMRecord)
@@ -1297,8 +1325,14 @@ function reference_map!(writer::BAMWriter, src::References)::Union{Nothing, Vect
     return map
 end
 
-# Write the record, but with the given reference IDs instead of the record's own.
-function write_record(writer::BAMWriter, record::BAMRecord, ref_id::Int32, next_ref_id::Int32)::Int
+# Write the record, but with the given reference IDs and bin instead of the record's own.
+function write_record(
+        writer::BAMWriter,
+        record::BAMRecord,
+        ref_id::Int32,
+        next_ref_id::Int32,
+        bin::UInt16,
+    )::Int
     writer.closed && throw(IOError(IOErrorKinds.ClosedIO))
     bgzf = writer.writer
     buffer = get_buffer(bgzf)
@@ -1320,8 +1354,10 @@ function write_record(writer::BAMWriter, record::BAMRecord, ref_id::Int32, next_
             (BAM_FIXED_BYTES % UInt)::Csize_t,
         )::Cvoid
     end
-    # Byte offsets of refID and next_refID, after the block size
+    # Byte offsets of refID, bin and next_refID, after the block size
     inbounds_store_le!(buffer, 5, ref_id)
+    @inbounds buffer[15] = bin % UInt8
+    @inbounds buffer[16] = (bin >> 8) % UInt8
     inbounds_store_le!(buffer, 25, next_ref_id)
     @inbounds consume(bgzf, n_header_bytes)
     # Write variable bytes
@@ -1418,15 +1454,6 @@ function try_copy_kind!(dst::BAMRecord, src::SAMRecord)::Union{BAMRecord, XAMErr
     dst.tlen = src.tlen
     dst.n_cigar_op = n_cigar_op % UInt16
     dst.l_seq = l_seq % UInt32
-    # Like htslib, records with no CIGAR, or one spanning no reference positions,
-    # are binned as spanning one position. Unmapped records with no position get bin 4680.
-    dst.bin = if dst.pos < 0
-        UInt16(4680)
-    else
-        # As `UInt64`, since the end may not fit in 32 bits
-        beg = dst.pos % UInt64
-        reg2bin(beg, beg + (max(ref_len, 1) % UInt64))
-    end
 
     # Variable-length fields, except auxiliary data
     l_read_name = (src.qname_len % Int) + 1

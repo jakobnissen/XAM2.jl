@@ -11,10 +11,10 @@ Only easy and superficial tests should be added; it is expected the code will be
 ## Design criteria
 * Use the type system to cover spec edge cases, e.g. return `nothing` for missing fields.
 * Distinguish between in-data edge cases (like missing data) versus IO or filesystem errors. The former should be represented
-  in the file system, the latter as exceptions, as they can rarely be sensibly handled.
-* Performance is very important for this codebase.
+  in the type system, the latter as exceptions, as they can rarely be sensibly handled.
+* Performance is very important for this codebase. You may consider this package to fill a similar function as (part of) htslib.
 
 ## Coding guidelines
-After making changes, format with `runic -i .`. If executable is not found or errors, alert the user, and do not attempt to install Runic.
+After making changes, format with `runic -i .`. If Runic executable is not found or errors, alert the user, and do not attempt to install Runic.
 For all user-facing operations, there must be a version that does not throw on malformed data. Bad user-provided inputs may cause exceptions.
 Records are parsed semi-lazily: Simple structural invariants are checked on record construction, which allows `@inbounds` to be used safely. However, variable-length data is lazily checked.
