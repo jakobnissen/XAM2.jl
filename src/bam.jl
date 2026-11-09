@@ -882,6 +882,147 @@ function template_length(record::BAMRecord)::Union{Int, Nothing}
     return iszero(record.tlen) ? nothing : record.tlen % Int
 end
 
+# Setters for the fixed-length fields of `BAMRecord`.
+# Each setter accepts exactly the values its getter can return, plus `nothing` for
+# missing, so that `getter(setter!(record, x)) == x`. Invalid input throws, and leaves
+# the record unchanged.
+
+"""
+    set_flags!(record::BAMRecord, flags::SAMFlags)::BAMRecord
+
+Set the flags of `record`, and return `record`.
+
+See also: [`flags`](@ref)
+"""
+function set_flags!(record::BAMRecord, flags::SAMFlags)
+    record.flags = flags
+    return record
+end
+
+"""
+    set_mapping_quality!(record::BAMRecord, mapq::Union{Nothing, Integer})::BAMRecord
+
+Set the mapping quality (MAPQ) of `record` to `mapq`, which must be in `0:254`,
+or to missing if `mapq` is `nothing`, and return `record`.
+Throw an `ArgumentError` if `mapq` is out of range. In particular, to set a missing
+mapping quality, pass `nothing`, not 255.
+
+See also: [`mapping_quality`](@ref)
+"""
+function set_mapping_quality!(record::BAMRecord, mapq::Union{Nothing, Integer})
+    record.mapq = if mapq === nothing
+        0xff
+    else
+        in(mapq, 0:254) || throw(ArgumentError(lazy"Mapping quality must be in 0:254, got $mapq"))
+        mapq % UInt8
+    end
+    return record
+end
+
+"""
+    set_left_position!(record::BAMRecord, pos::Union{Nothing, Integer})::BAMRecord
+
+Set the 1-based leftmost mapped position (POS) of `record` to `pos`, or to missing if
+`pos` is `nothing`, and return `record`.
+Throw an `ArgumentError` if `pos` is not in `1:typemax(Int32)`.
+
+The position is not checked against the length of the reference, nor against the CIGAR,
+so it may be set before or after the reference.
+
+See also: [`left_position`](@ref), [`set_reference!`](@ref)
+"""
+function set_left_position!(record::BAMRecord, pos::Union{Nothing, Integer})
+    record.pos = bam_position(pos)
+    return record
+end
+
+"""
+    set_next_position!(record::BAMRecord, pos::Union{Nothing, Integer})::BAMRecord
+
+Set the 1-based leftmost position of the next segment in the template (PNEXT) of
+`record` to `pos`, or to missing if `pos` is `nothing`, and return `record`.
+Throw an `ArgumentError` if `pos` is not in `1:typemax(Int32)`.
+
+See also: [`next_position`](@ref), [`set_left_position!`](@ref)
+"""
+function set_next_position!(record::BAMRecord, pos::Union{Nothing, Integer})
+    record.next_pos = bam_position(pos)
+    return record
+end
+
+# The 0-based BAM position of a 1-based position, or -1 if missing.
+# Invariant: The result is in `BAM_POSITIONS`.
+function bam_position(pos::Union{Nothing, Integer})::Int32
+    pos === nothing && return Int32(-1)
+    in(pos, 1:typemax(Int32)) || throw(ArgumentError(lazy"Position must be in 1:$(typemax(Int32)), got $pos"))
+    return Int32(pos) - Int32(1)
+end
+
+"""
+    set_reference!(record::BAMRecord, ref::Union{Nothing, Integer, AbstractString})::BAMRecord
+
+Set the reference (RNAME) of `record`, and return `record`. `ref` may be:
+* A 1-based index into [`references(record)`](@ref references), like the one returned
+  by [`reference_index`](@ref). Throw a `BoundsError` if it is out of bounds.
+* The name of a reference in `references(record)`. Throw a `KeyError` if no reference
+  has this name.
+* `nothing`, for a record with no reference.
+
+The next reference (RNEXT) is not changed, and the position is not checked against
+the length of the new reference.
+
+See also: [`reference_index`](@ref), [`reference_name`](@ref), [`set_next_reference!`](@ref)
+"""
+function set_reference!(record::BAMRecord, ref::Union{Nothing, Integer, AbstractString})
+    record.refID = bam_reference_id(record.refs, ref)
+    return record
+end
+
+"""
+    set_next_reference!(record::BAMRecord, ref::Union{Nothing, Integer, AbstractString})::BAMRecord
+
+Set the reference of the next segment in the template (RNEXT) of `record`, and
+return `record`. `ref` is as in [`set_reference!`](@ref).
+
+See also: [`next_reference_index`](@ref), [`next_reference_name`](@ref)
+"""
+function set_next_reference!(record::BAMRecord, ref::Union{Nothing, Integer, AbstractString})
+    record.next_refID = bam_reference_id(record.refs, ref)
+    return record
+end
+
+# The 0-based reference ID of `ref` in `refs`, or -1 if missing.
+# Invariant: The result is in `-1:(length(refs) - 1)`.
+function bam_reference_id(refs::References, ref::Union{Nothing, Integer, AbstractString})::Int32
+    ref === nothing && return Int32(-1)
+    ref isa AbstractString && return @something reference_id(refs, ref) throw(KeyError(ref))
+    in(ref, 1:length(refs)) || throw(BoundsError(refs, ref))
+    # References has at most typemax(Int32) elements
+    return Int32(ref) - Int32(1)
+end
+
+"""
+    set_template_length!(record::BAMRecord, tlen::Union{Nothing, Integer})::BAMRecord
+
+Set the observed template length (TLEN) of `record` to `tlen`, or to missing if `tlen`
+is `nothing`, and return `record`.
+Throw an `ArgumentError` if `tlen` is zero, or does not fit in an `Int32`.
+To set a missing template length, pass `nothing`, not zero.
+
+See also: [`template_length`](@ref)
+"""
+function set_template_length!(record::BAMRecord, tlen::Union{Nothing, Integer})
+    record.tlen = if tlen === nothing
+        Int32(0)
+    else
+        if iszero(tlen) || !in(tlen, typemin(Int32):typemax(Int32))
+            throw(ArgumentError(lazy"Template length must be a nonzero Int32, got $tlen"))
+        end
+        Int32(tlen)
+    end
+    return record
+end
+
 function cigar(record::BAMRecord)::Union{Nothing, BAMCIGAR, XAMError}
     encoding = @something get_cigar_encoding(record) return nothing
     cig = CIGARStrings.try_parse(BAMCIGAR, encoding)
