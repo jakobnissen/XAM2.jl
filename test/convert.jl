@@ -130,3 +130,34 @@ end
         @test is_reset(sam)
     end
 end
+
+@testset "Record equality" begin
+    bam_records = read_bam(EXAMPLE_BAM)
+    sam_records = SAMReader(collect, open(EXAMPLE_SAM))
+    for records in (bam_records, sam_records)
+        (a, b) = records[1:2]
+        @test a == copy(a)
+        @test hash(a) == hash(copy(a))
+        @test a != b
+        @test isequal(unique(vcat(records, map(copy, records))), records)
+    end
+
+    # SAM records are equal if their lines are
+    line = sam_line(VALID_FIELDS)
+    @test try_parse_line(line) == try_parse_line(line)
+    @test try_parse_line(line) != try_parse_line(line * "\tNM:i:1")
+
+    # BAM records are equal if their references have the same content: Each reader
+    # has its own `References`
+    other_read = read_bam(EXAMPLE_BAM)
+    @test first(other_read).refs !== first(bam_records).refs
+    @test other_read == bam_records
+    # ... but not if the references differ
+    refs = first(bam_records).refs
+    other_refs = References(map(r -> r.name, refs), map(r -> r.length + 1, refs))
+    sam = first(sam_records)
+    @test copy!(BAMRecord(other_refs), sam) != copy!(BAMRecord(refs), sam)
+    # A record that differs only in a fixed field
+    @test copy!(BAMRecord(refs), try_parse_line(with_field(5, "59"))) !=
+        copy!(BAMRecord(refs), try_parse_line(line))
+end

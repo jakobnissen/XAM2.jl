@@ -104,6 +104,8 @@ will not be validated until queries.
 
 Construct a valid, but empty record with `SAMRecord()`.
 
+Two `SAMRecord`s are `==` if their lines are identical.
+
 !!! warning
     Mutating its backing memory will invalidate the record and
     lead to logic bugs and garbage results, but should never cause
@@ -364,6 +366,9 @@ function Base.copy(record::SAMRecord)
     return new
 end
 
+# The other fields are parsed from `data`, so they are equal if the lines are equal.
+Base.:(==)(a::SAMRecord, b::SAMRecord) = a.data == b.data
+Base.hash(x::SAMRecord, h::UInt) = hash(x.data, h ⊻ (0x2c1ae1a1d1e5a3f7 % UInt))
 
 # Short form: Mapped, read name, strand
 function Base.show(io::IO, record::SAMRecord)
@@ -611,35 +616,38 @@ function template_length(record::SAMRecord)::Union{Int, Nothing}
 end
 
 """
-    mutable struct SAMReader{T <: AbstractBufReader}
-
-Lazy reader of SAM files.
-
-`rdr = SAMReader` is an iterator over `SAMRecord`.
-The header can be obtained with [`get_header`](@ref)
-
-    SAMReader(
-        io::Union{IO, AbstractBufReader};
-        copy::Bool = true,
-    )::SAMReader
+    SAMReader(io::IO; copy::Bool=true)::SAMReader{BufReader{typeof(io)}}
+    SAMReader(io::AbstractBufReader; copy::Bool=true)::SAMReader{typeof(io)}
 
 Construct a `SAMReader` from `io`, reading and validating the header.
-This reader takes control of `io`. Mutating `io` after the reader is constructed
-is not permitted. Closing the resulting reader will close `io`.
-If the header is malformed, `io` is closed and an `XAMError` is thrown.
-See [`XAM2.try_init`](@ref) for a version that returns the error instead.
 
+`SAMReader`s are iterators of `SAMRecord`.
 If `copy` is `false`, every record returned by iterating the reader or from
 `XAM2.try_read!` will be the same record, overwritten in-place. This improves
 efficiency, but new records will invalidate every previous one.
-To prevent aliasing, `copy` can be called manually on records.
+To prevent aliasing with `copy=false`, `copy` can be called manually on records.
+
+The reader takes control of `io`. Mutating `io` after the reader is constructed
+is not permitted. Closing the resulting reader will close `io`.
+To obtain the passed in reader, use `BufferIO.take_inner(::SAMReader)`.
+
+If the header is malformed, an `XAMError` is thrown.
+See [`XAM2.try_init`](@ref) for a version that returns the error instead.
+If construction fails, `io` is not closed, and remains owned by the caller.
+Its position is then unspecified.
+
+
 """
 mutable struct SAMReader{T <: AbstractBufReader}
     # Wrapping the reader lets us buffer whole lines, even if the inner reader can't.
     # If the inner reader can expand its buffer, the `ExpandReader` forwards it.
-    # TODO: BufReader is the most common T, and does not require ExpandReader. If computed
-    # field types land in Julia, make this field T when T is BufReader, else ExpandReader{T}.
+    # TODO: If computed field types land in Julia, make this field `T` when
+    # `is_expandable(T)`, else `ExpandReader{T}`, i.e. the type of `expandable(source)`,
+    # and remove `source`.
     const reader::ExpandReader{T}
+    # The reader this reader was constructed from, returned by `take_inner` if it is
+    # expandable. Then `reader` only forwards its buffer, so the two are in the same state.
+    const source::T
     const record::SAMRecord
     const header::SAMHeader
     # Number of lines in the header, used to compute line numbers of records
@@ -660,8 +668,10 @@ throwing if the header is malformed.
 
 This function does not throw if the header is malformed. Errors from the underlying IO
 are thrown, including errors from `BGZFLib` if the BGZF compression of a BAM file
-is malformed. If construction fails, either by returning an error or throwing,
-`io` is closed, since the reader takes ownership of it.
+is malformed.
+
+If construction fails, either by returning an error or throwing, `io` (or `bgzf`)
+is not closed, and remains owned by the caller. Its position is then unspecified.
 
 # Examples
 ```julia
@@ -675,18 +685,15 @@ end
 """
 function try_init end
 
-function try_init(::Type{SAMReader}, reader::AbstractBufReader; copy::Bool = true)::Union{SAMReader, XAMError}
-    return try_init(SAMReader, ExpandReader(reader); copy)
-end
-
-function try_init(::Type{SAMReader}, reader::ExpandReader{T}; copy::Bool = true)::Union{SAMReader{T}, XAMError} where {T}
-    header = close_on_throw(() -> read_initial_sam_header!(reader), reader)
-    if header isa XAMError
-        close(reader)
-        return header
-    end
+# An `ExpandReader` passed in is wrapped in another one, so that `T` is the type of
+# `source`, which `take_inner` returns.
+function try_init(::Type{SAMReader}, source::T; copy::Bool = true)::Union{SAMReader{T}, XAMError} where {T <: AbstractBufReader}
+    # The reader only takes ownership of `source` on success, so it's not closed on failure
+    reader = ExpandReader(source)
+    header = read_initial_sam_header!(reader)
+    header isa XAMError && return header
     n_header_lines = count(==(UInt8('\n')), MemoryView(header))
-    return SAMReader{T}(reader, SAMRecord(), header, n_header_lines, copy, 0, nothing)
+    return SAMReader{T}(reader, source, SAMRecord(), header, n_header_lines, copy, 0, nothing)
 end
 
 function try_init(::Type{SAMReader}, io::IO; copy::Bool = true)::Union{SAMReader, XAMError}
@@ -708,9 +715,34 @@ function SAMReader(f::Function, args::Vararg{Any, N}; kwargs...) where {N}
     end
 end
 
+# Closing twice is a no-op, so that closing after `take_inner` does not close the
+# taken reader, e.g. in the `do`-block form of `SAMReader`.
 function Base.close(reader::SAMReader)
+    is_closed(reader) && return nothing
     reader.error = XAMError(XAMErrors.closed_stream)
     return close(reader.reader)
+end
+
+Base.isopen(reader::SAMReader) = !is_closed(reader) && isopen(reader.reader)
+
+"""
+    BufferIO.take_inner(reader::SAMReader{T})::Union{T, ExpandReader{T}}
+
+Close `reader` and take the inner reader of type `T`, without closing the inner reader.
+That is:
+* If `reader` was created from an `I::IO`, return the `T::BufReader{I}`
+* If `reader` was created from an `A::AbstractBufReader`, return the type of `BufferIO.expandable(A)`,
+  i.e. `A` is `BufferIO.is_expandable(A)`, else `ExpandReader{A}.`
+
+The returned reader is positioned after the last record read by `reader`, or after
+the header if no records were read.
+
+Calling this on an already closed `reader` throws a `BufferIO.IOError` of kind `ClosedIO`.
+"""
+function BufferIO.take_inner(reader::SAMReader{T}) where {T}
+    is_closed(reader) && throw(IOError(IOErrorKinds.ClosedIO))
+    reader.error = XAMError(XAMErrors.closed_stream)
+    return BufferIO.is_expandable(T) ? reader.source : reader.reader
 end
 
 get_header(reader::SAMReader) = reader.header

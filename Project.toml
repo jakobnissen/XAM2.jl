@@ -20,7 +20,7 @@ BioSequencesExt = "BioSequences"
 
 [compat]
 Automa = "1.1.0"
-BGZFLib = "0.2.1"
+BGZFLib = "0.2.2"
 BioSequences = "3.5.0"
 BufferIO = "0.3"
 CIGARStrings = "0.3.0"

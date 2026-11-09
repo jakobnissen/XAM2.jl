@@ -221,8 +221,12 @@ Construct a `BAMReader` from `io`, by wrapping `io` in a `BGZFLib.BGZFReader`,
 reading and validating the header.
 This reader takes control of `io`. Mutating `io` after the reader is constructed
 is not permitted. Closing the resulting reader will close `io`.
-If the binary header is malformed, `io` is closed and an `XAMError` is thrown.
+To obtain the `BGZFReader`, use `BufferIO.take_inner(::BAMReader)`.
+
+If the binary header is malformed, an `XAMError` is thrown.
 See [`XAM2.try_init`](@ref) for a version that returns the error instead.
+If construction fails, `io` (or `bgzf`) is not closed, and remains owned by the caller.
+Its position is then unspecified.
 By default, a malformed text header, or one whose `@SQ` lines disagree with the
 binary references, does not prevent reading records, see [`get_header`](@ref).
 If `strict_header` is `true`, such a header is instead an error when constructing
@@ -263,17 +267,12 @@ function try_init(
         copy::Bool = true,
         strict_header::Bool = false,
     )::Union{BAMReader{T}, XAMError} where {T}
+    # The reader only takes ownership of `reader` on success, so it's not closed on failure
     buffer = UInt8[]
-    parsed = close_on_throw(() -> parse_bam_header!(reader, buffer), reader)
-    if parsed isa XAMError
-        close(reader)
-        return parsed
-    end
+    parsed = parse_bam_header!(reader, buffer)
+    parsed isa XAMError && return parsed
     (; header, refs) = parsed
-    if strict_header && header isa XAMError
-        close(reader)
-        return header
-    end
+    strict_header && header isa XAMError && return header
     vo_at_first_record = virtual_position(reader)
     record = new_bam_record(refs, buffer)
     return BAMReader{T}(reader, refs, header, vo_at_first_record, copy, record, nothing)
@@ -286,9 +285,18 @@ function try_init(
         n_workers::Int = Threads.nthreads(),
         strict_header::Bool = false,
     )::Union{BAMReader, XAMError}
-    # The BGZFReader constructor reads from `io`, which may throw
-    bgzf = close_on_throw(() -> BGZFReader(io; n_workers), io)
-    return try_init(BAMReader, bgzf; copy, strict_header)
+    # If the constructor throws, it has not spawned any workers, so there is nothing to clean up
+    bgzf = BGZFReader(io; n_workers)
+    # We own `bgzf`, but the caller owns `io`, so on failure, stop the workers of `bgzf`
+    # without closing `io`.
+    result = try
+        try_init(BAMReader, bgzf; copy, strict_header)
+    catch
+        BufferIO.take_inner(bgzf)
+        rethrow()
+    end
+    result isa XAMError && BufferIO.take_inner(bgzf)
+    return result
 end
 
 get_header(reader::BAMReader) = reader.header
@@ -338,6 +346,26 @@ function Base.copy(record::BAMRecord)
     return copy_fixed_fields!(cp, record)
 end
 
+function fixed_fields(x::BAMRecord)
+    return (
+        x.refID, x.pos, x.l_read_name, x.mapq, x.bin, x.n_cigar_op,
+        x.flags, x.l_seq, x.next_refID, x.next_pos, x.tlen,
+    )
+end
+
+# The references are compared by content, since a record's reference IDs refer to them.
+function Base.:(==)(a::BAMRecord, b::BAMRecord)
+    fixed_fields(a) == fixed_fields(b) || return false
+    a.data == b.data || return false
+    return a.refs === b.refs || a.refs == b.refs
+end
+
+# The references are not hashed, since hashing them is slow, and it's rarely useful
+# to distinguish between records that only differ by their references.
+function Base.hash(x::BAMRecord, h::UInt)
+    return hash(x.data, hash(fixed_fields(x), h ⊻ (0x7b3d0e5f9a64c812 % UInt)))
+end
+
 function copy_fixed_fields!(dst::BAMRecord, src::BAMRecord)
     GC.@preserve dst src begin
         dst_ptr = Ptr{UInt8}(pointer_from_objref(dst)) + FIXED_BAM_OFFSET
@@ -356,6 +384,8 @@ function seek_first_record(reader::BAMReader)
 end
 
 function Base.seek(reader::BAMReader, offset::VirtualOffset)
+    # After `take_inner`, the `BGZFReader` is still open, but is no longer owned by `reader`
+    is_closed(reader) && throw(IOError(IOErrorKinds.ClosedIO))
     # Seeking fills the buffer, which may fail on malformed BGZF data. Then, the error
     # is returned on the next read, as if reading from `offset` failed.
     result = catch_data_error(() -> seek(reader.reader, offset))
@@ -491,7 +521,7 @@ try_fill_buffer(reader::AbstractBufReader) = catch_data_error(() -> fill_buffer(
     end
 end
 
-Base.isopen(x::BAMReader) = isopen(x.reader)
+Base.isopen(x::BAMReader) = !is_closed(x) && isopen(x.reader)
 
 function BAMReader(reader::BGZFReader; copy::Bool = true, strict_header::Bool = false)
     result = try_init(BAMReader, reader; copy, strict_header)
@@ -532,9 +562,51 @@ function Base.show(io::IO, ::MIME"text/plain", reader::BAMReader)
     return print(io, "TODO!")
 end
 
+# Closing twice is a no-op, so that closing after `take_inner` does not close the
+# taken reader, e.g. in the `do`-block form of `BAMReader`.
 function Base.close(reader::BAMReader)
+    is_closed(reader) && return nothing
     reader.error = XAMError(XAMErrors.closed_stream)
     return close(reader.reader)
+end
+
+"""
+    virtual_position(reader::BAMReader)::VirtualOffset
+
+Get the virtual offset of the next record to be read from `reader`, or of the end
+of the file if `reader` is EOF. Seeking `reader` to this offset with `seek` resumes
+reading from that record.
+After `reader` has returned an error, the position is unspecified.
+
+If the next record starts at the beginning of a BGZF block, the offset may instead be the
+end of the previous block, which is equivalent when seeking, and vice versa.
+
+Throw an `IOError` of kind `ClosedIO` if `reader` is closed.
+"""
+function BGZFLib.virtual_position(reader::BAMReader)
+    # After `take_inner`, the `BGZFReader` is still open, but is no longer owned by `reader`
+    is_closed(reader) && throw(IOError(IOErrorKinds.ClosedIO))
+    return virtual_position(reader.reader)
+end
+
+"""
+    BufferIO.take_inner(reader::BAMReader{T})::BGZFReader{T}
+
+Close `reader` and take its `BGZFLib.BGZFReader`, without closing it.
+The `BGZFReader` can itself be closed, or passed to
+`BufferIO.take_inner` to get the underlying compressed stream.
+
+The returned BGZF reader contains the decompressed BAM data,
+and is positioned after the last
+record read by `reader`, or at the first record if no records were read.
+After `reader` returned an error, its position is unspecified.
+
+Calling this on an already closed `reader` throws a `BufferIO.IOError` of kind `ClosedIO`.
+"""
+function BufferIO.take_inner(reader::BAMReader)
+    is_closed(reader) && throw(IOError(IOErrorKinds.ClosedIO))
+    reader.error = XAMError(XAMErrors.closed_stream)
+    return reader.reader
 end
 
 BAMRecord(refs::References) = new_bam_record(refs, UInt8[])
@@ -992,6 +1064,7 @@ Writer of BAM files.
 Construct a `BAMWriter` writing to `io`, by wrapping `io` in a `BGZFLib.BGZFWriter`.
 The header and references are written immediately.
 Closing the resulting writer will close `io`.
+To obtain the `BGZFWriter` without closing it, use `BufferIO.take_inner(::BAMWriter)`.
 
 The text of `header` is written verbatim. If `header` contains `@SQ` lines, they must
 match `refs`, else an `ArgumentError` is thrown. If `refs` is not passed, it is
@@ -1032,6 +1105,9 @@ mutable struct BAMWriter{T <: AbstractBufWriter}
     last_src::Union{Nothing, References}
     last_map::Union{Nothing, Vector{Int32}}
     const maps::IdDict{References, Union{Nothing, Vector{Int32}}}
+    # Set by `close` and `take_inner`. After `take_inner`, `writer` is still open,
+    # but no longer owned by this writer.
+    closed::Bool
 end
 
 references(writer::BAMWriter) = writer.refs
@@ -1075,7 +1151,7 @@ function BAMWriter(
     end
 
     maps = IdDict{References, Union{Nothing, Vector{Int32}}}()
-    return BAMWriter{T}(writer, refs, nothing, nothing, maps)
+    return BAMWriter{T}(writer, refs, nothing, nothing, maps, false)
 end
 
 # Write `x` as 4 little-endian bytes.
@@ -1124,8 +1200,51 @@ function Base.show(io::IO, ::MIME"text/plain", writer::BAMWriter)
     return print(io, "TODO!")
 end
 
-Base.close(writer::BAMWriter) = close(writer.writer)
-Base.flush(writer::BAMWriter) = flush(writer.writer)
+# Closing twice is a no-op, so that closing after `take_inner` does not close the
+# taken writer, e.g. in the `do`-block form of `BAMWriter`.
+function Base.close(writer::BAMWriter)
+    writer.closed && return nothing
+    writer.closed = true
+    return close(writer.writer)
+end
+
+function Base.flush(writer::BAMWriter)
+    writer.closed && throw(IOError(IOErrorKinds.ClosedIO))
+    return flush(writer.writer)
+end
+
+Base.isopen(writer::BAMWriter) = !writer.closed && isopen(writer.writer)
+
+"""
+    BufferIO.take_inner(writer::BAMWriter{T})::BGZFWriter{T}
+
+Close `writer` and take its `BGZFLib.BGZFWriter`, without closing or flushing it.
+This is the `BGZFWriter` `writer` was constructed from, or the one it created when
+constructed from an `io`.
+Records are written directly to the `BGZFWriter`, so it contains everything written
+to `writer`. Closing the `BGZFWriter` completes the BAM file by writing the BGZF EOF block,
+unless it was created with `append_empty = false`. It can also be passed to
+`BufferIO.take_inner` to get the underlying writer without closing it.
+
+Calling this on an already closed `writer` throws a `BufferIO.IOError` of kind `ClosedIO`.
+After this, writing to `writer` throws the same error, and `close(writer)` does nothing.
+
+# Examples
+```julia
+buffer = IOBuffer()
+writer = BAMWriter(buffer, header)
+write(writer, record)
+bgzf = BufferIO.take_inner(writer)
+# Write the remaining data and the EOF block, without closing `buffer`
+flush(BufferIO.take_inner(bgzf))
+bam_bytes = take!(buffer)
+```
+"""
+function BufferIO.take_inner(writer::BAMWriter)
+    writer.closed && throw(IOError(IOErrorKinds.ClosedIO))
+    writer.closed = true
+    return writer.writer
+end
 
 """
     XAM2.try_write(writer::BAMWriter, record::BAMRecord)::Union{Int, XAMError}
@@ -1180,6 +1299,7 @@ end
 
 # Write the record, but with the given reference IDs instead of the record's own.
 function write_record(writer::BAMWriter, record::BAMRecord, ref_id::Int32, next_ref_id::Int32)::Int
+    writer.closed && throw(IOError(IOErrorKinds.ClosedIO))
     bgzf = writer.writer
     buffer = get_buffer(bgzf)
     n_header_bytes = 4 + BAM_FIXED_BYTES
@@ -1347,6 +1467,7 @@ function try_copy_kind!(dst::BAMRecord, src::SAMRecord)::Union{BAMRecord, XAMErr
     dst_aux = XAMAuxData.BAM.Auxiliary(data, length(data) + 1)
     copy!(dst_aux, src_aux)
     if cigar_in_aux
+        cig = something(cig)
         delete!(dst_aux, "CG")
         # CG:B:I array of the CIGAR's BAM encoding
         old_len = length(data)

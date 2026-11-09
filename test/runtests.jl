@@ -1,10 +1,11 @@
 using Test
 using XAM2
 using XAM2: XAMErrors, Reference, try_write, try_parse_header, seek_first_record
-using BGZFLib: BGZFReader, BGZFWriter, BGZFError, VirtualOffset
+using BGZFLib: BGZFReader, BGZFWriter, BGZFError, VirtualOffset, virtual_position
 using MemoryViews: ImmutableMemoryView, MemoryView
 using CIGARStrings: CIGARStrings, CIGAR, CIGARError
 using XAM2: AuxTag
+using XAM2.BufferIO: BufWriter, BufReader, ExpandReader, IOError, take_inner
 
 const DATADIR = joinpath(@__DIR__, "data")
 # Created from example.sam with `samtools view --no-PG -b -o example.bam example.sam`
@@ -255,5 +256,7 @@ include("malformed.jl")
 include("header.jl")
 include("sam.jl")
 include("convert.jl")
+include("samwriter.jl")
+include("bam_take_inner.jl")
 include("qualityview.jl")
 include("biosequences.jl")

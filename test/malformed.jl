@@ -158,7 +158,8 @@ end
             # ... unless `strict_header` is set
             io = open(malformed_bam(dir; text = "@XX"))
             @test XAM2.try_init(BAMReader, io; n_workers = 1, strict_header = true) isa XAMError
-            @test !isopen(io)
+            @test isopen(io)
+            close(io)
             io = open(malformed_bam(dir; text = "@SQ\tSN:chr1\tLN:1000\n"))
             @test XAM2.try_init(BAMReader, io; n_workers = 1, strict_header = true) ==
                 XAMError(XAMErrors.header_reference_mismatch)
@@ -167,32 +168,35 @@ end
             @test get_header(reader) isa SAMHeader
             close(reader)
 
-            # On failure, the error is returned, and the input is closed
+            # On failure, the error is returned, and the input is not closed
             io = open(malformed_bam(dir; refs = [("a", 1), ("a", 2)]))
             @test XAM2.try_init(BAMReader, io; n_workers = 1) == XAMError(XAMErrors.duplicate_reference)
-            @test !isopen(io)
+            @test isopen(io)
+            close(io)
             # Also when passing a BGZFReader
             path = tempname(dir)
             BGZFWriter(io -> write(io, [b"BAM\1"; le_bytes(UInt32(100))]), open(path, "w"))
             bgzf = BGZFReader(open(path); n_workers = 1)
             @test XAM2.try_init(BAMReader, bgzf) == XAMError(XAMErrors.header_truncated)
-            @test !isopen(bgzf)
+            @test isopen(bgzf)
+            close(bgzf)
             # Malformed BGZF data is returned as an error
             io = IOBuffer(b"not a BAM file")
             err = XAM2.try_init(BAMReader, io; n_workers = 1)
             @test err.kind == XAMErrors.bgzf_error
             @test err.wrapped_error isa BGZFError
-            @test !isopen(io)
+            @test isopen(io)
             path = tempname(dir)
             write(path, corrupt_crc!(bgzf_compress(dir, raw_bam_header(; text = "@HD\tVN:1.6\n"))))
             io = open(path)
             @test error_kind(XAM2.try_init(BAMReader, io; n_workers = 1)) == XAMErrors.bgzf_error
-            @test !isopen(io)
+            @test isopen(io)
+            close(io)
 
-            # IO errors are thrown, but the input is still closed
+            # IO errors are thrown, and the input is still not closed
             io = FailingIO(true)
             @test_throws ErrorException("simulated IO failure") XAM2.try_init(BAMReader, io; n_workers = 1)
-            @test !isopen(io)
+            @test isopen(io)
         end
     end
 end

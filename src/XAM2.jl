@@ -4,7 +4,10 @@ using BufferIO: BufferIO,
     AbstractBufReader,
     AbstractBufWriter,
     BufReader,
+    BufWriter,
     ExpandReader,
+    IOError,
+    IOErrorKinds,
     VecWriter,
     get_nonempty_buffer,
     get_unflushed,
@@ -22,7 +25,7 @@ using MemoryViews:
     split_each
 
 using StringViews: StringView
-using BGZFLib: BGZFReader, BGZFWriter, BGZFError, is_data_error, virtual_position, VirtualOffset
+using BGZFLib: BGZFLib, BGZFReader, BGZFWriter, BGZFError, is_data_error, virtual_position, VirtualOffset
 using CIGARStrings: CIGARStrings, AbstractCIGAR, BAMCIGAR, CIGAR, CIGARError
 using XAMAuxData: XAMAuxData, AuxTag, try_auxtag, is_well_formed
 
@@ -33,6 +36,7 @@ export BAMRecord,
     BAMWriter,
     SAMRecord,
     SAMReader,
+    SAMWriter,
     SAMHeader,
     SAMFlag,
     SAMFlags,
@@ -505,16 +509,10 @@ Seek `reader` back to the first record.
 """
 function seek_first_record end
 
-# Run `f()`, closing `io` if it throws. Used when constructing readers, which take
-# ownership of `io`: If construction fails, the caller has no reader to close.
-# The exception is rethrown, not handled.
-function close_on_throw(f, io)
-    return try
-        f()
-    catch
-        close(io)
-        rethrow()
-    end
+# Whether the reader has been closed by `close` or `take_inner`
+function is_closed(reader)::Bool
+    err = reader.error
+    return err !== nothing && err.kind == XAMErrors.closed_stream
 end
 
 # Errors are sticky until the reader is seeked, except if it's closed
@@ -535,6 +533,7 @@ include("bamseq.jl")
 include("qualityview.jl")
 include("sam.jl")
 include("bam.jl")
+include("samwriter.jl")
 
 """
 Alias for Union{SAMRecord, BAMRecord}

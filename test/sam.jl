@@ -310,13 +310,17 @@ end
         @test length(collect(reader)) == 6
         close(reader)
 
-        # On failure, the error is returned, and the input is closed
+        # On failure, the error is returned, and the input is not closed
         io = IOBuffer("@HD\tVN:1.6\n@SQ\tSN:x\n" * sam_line(VALID_FIELDS))
         @test XAM2.try_init(SAMReader, io) == XAMError(XAMErrors.header_missing_ln; line = 2, column = 1)
-        @test !isopen(io)
+        @test isopen(io)
         io = IOBuffer("@HD\tVN:1.6\n@SQ\tSN:x\n")
         @test_throws XAMError(XAMErrors.header_missing_ln; line = 2, column = 1) SAMReader(io)
-        @test !isopen(io)
+        @test isopen(io)
+        # Also when an IO error is thrown
+        io = FailingIO(true)
+        @test_throws ErrorException("simulated IO failure") SAMReader(io)
+        @test isopen(io)
     end
 
     @testset "Readers that can't buffer a whole line" begin
