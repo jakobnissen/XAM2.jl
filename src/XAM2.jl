@@ -68,6 +68,7 @@ export BAMRecord,
     is_last,
     mapping_span,
     mapping_blocks,
+    set_query_name!,
     set_flags!,
     set_mapping_quality!,
     set_left_position!,
@@ -530,6 +531,14 @@ function clear_error!(reader)
     end
     return nothing
 end
+
+# TODO: Errors in hot functions are thrown by `@noinline` helpers like `throw_invalid_value`,
+# since constructing an error inline makes the function set up a GC frame and bloats it.
+# https://github.com/JuliaLang/julia/pull/64732 makes the compiler outline such error paths.
+# If it lands, and the minimum supported Julia version includes it, the helpers can be
+# inlined again. However, the PR only outlines from functions that are then small enough
+# to inline, so check the generated code of each function before removing its helper,
+# e.g. `replace_region!` and `set_query_name!` may be too large.
 
 include("flags.jl")
 include("stringvec.jl")

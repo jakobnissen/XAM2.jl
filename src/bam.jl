@@ -882,6 +882,11 @@ function template_length(record::BAMRecord)::Union{Int, Nothing}
     return iszero(record.tlen) ? nothing : record.tlen % Int
 end
 
+# Errors are thrown by outlined functions, since constructing an error inline makes
+# the caller set up a GC frame. See the TODO about this in XAM2.jl.
+@noinline throw_invalid_value(msg::String, value) = throw(ArgumentError(string(msg, ", got ", repr(value))))
+@noinline throw_key_error(key) = throw(KeyError(key))
+
 # Setters for the fixed-length fields of `BAMRecord`.
 # Each setter accepts exactly the values its getter can return, plus `nothing` for
 # missing, so that `getter(setter!(record, x)) == x`. Invalid input throws, and leaves
@@ -913,7 +918,7 @@ function set_mapping_quality!(record::BAMRecord, mapq::Union{Nothing, Integer})
     record.mapq = if mapq === nothing
         0xff
     else
-        in(mapq, 0:254) || throw(ArgumentError(lazy"Mapping quality must be in 0:254, got $mapq"))
+        in(mapq, 0:254) || throw_invalid_value("Mapping quality must be in 0:254", mapq)
         mapq % UInt8
     end
     return record
@@ -954,7 +959,7 @@ end
 # Invariant: The result is in `BAM_POSITIONS`.
 function bam_position(pos::Union{Nothing, Integer})::Int32
     pos === nothing && return Int32(-1)
-    in(pos, 1:typemax(Int32)) || throw(ArgumentError(lazy"Position must be in 1:$(typemax(Int32)), got $pos"))
+    in(pos, 1:typemax(Int32)) || throw_invalid_value("Position must be in 1:2147483647", pos)
     return Int32(pos) - Int32(1)
 end
 
@@ -995,7 +1000,7 @@ end
 # Invariant: The result is in `-1:(length(refs) - 1)`.
 function bam_reference_id(refs::References, ref::Union{Nothing, Integer, AbstractString})::Int32
     ref === nothing && return Int32(-1)
-    ref isa AbstractString && return @something reference_id(refs, ref) throw(KeyError(ref))
+    ref isa AbstractString && return @something reference_id(refs, ref) throw_key_error(ref)
     in(ref, 1:length(refs)) || throw(BoundsError(refs, ref))
     # References has at most typemax(Int32) elements
     return Int32(ref) - Int32(1)
@@ -1016,11 +1021,214 @@ function set_template_length!(record::BAMRecord, tlen::Union{Nothing, Integer})
         Int32(0)
     else
         if iszero(tlen) || !in(tlen, typemin(Int32):typemax(Int32))
-            throw(ArgumentError(lazy"Template length must be a nonzero Int32, got $tlen"))
+            throw_invalid_value("Template length must be a nonzero Int32", tlen)
         end
         Int32(tlen)
     end
     return record
+end
+
+# Aliasing
+# Setters that change the length of a variable-length field move the bytes after it.
+# A setter's input may be a view of the record's own data, e.g. when setting the name
+# from an auxiliary string value with `set_query_name!(r, aux_data(r)["RX"])`, in which
+# case the input's bytes may be moved or overwritten before they are read.
+# For views of predictable types (see `DataView`), setters handle this without copying:
+# 1. `data_indices` finds the indices in `data` of the input's bytes, if it is a view of it.
+#    String inputs are checked by their `codeunits`, which for `StringView`s of
+#    `MemoryView`s, and substrings of those, is a `MemoryView`. This covers the strings
+#    returned by the accessors, so setters only need to handle arrays.
+# 2. `replace_region!` writes the new content at a point where the input is intact, and
+#    passes the input's current location to the writing function.
+# Aliasing by other types, e.g. user-defined views, is not detected, and is the user's
+# responsibility, so the docstrings of such setters must warn about it.
+
+# SubArrays with fast linear indexing are contiguous when their first index is an
+# `AbstractUnitRange`, or all their indices are scalars.
+const ContiguousByteSubArray{N, P} = SubArray{UInt8, N, P, I, true} where {
+    I <: Union{Tuple{AbstractUnitRange, Vararg{Any}}, Tuple{Vararg{Integer}}},
+}
+
+# Types of byte vectors that are checked for aliasing the record's data.
+# Views returned by accessors of `BAMRecord`, and the code units of strings returned
+# by them, are `MemoryView`s.
+const DataView = Union{
+    MemoryView{UInt8},
+    ContiguousByteSubArray{1, <:Union{Vector{UInt8}, Memory{UInt8}, MemoryView{UInt8}}},
+}
+
+# The indices in `data` of the bytes of `x`, if `x` is a non-empty view of the memory of
+# `data`, else `nothing`. This only compares addresses, so `x` may be a view of any memory.
+data_indices(::Vector{UInt8}, ::Any) = nothing
+
+function data_indices(data::Vector{UInt8}, x::DataView)::Union{Nothing, UnitRange{Int}}
+    n = length(x) % UInt
+    iszero(n) && return nothing
+    # Comparing addresses does not dereference them, so the objects need not be preserved
+    p = UInt(pointer(x))
+    d = UInt(pointer(data))
+    p < d && return nothing
+    start = p - d
+    len = length(data) % UInt
+    (start <= len) & (n <= len - start) || return nothing
+    return ((start + 1) % Int):((start + n) % Int)
+end
+
+# Replace the `old_len` bytes of `record.data` after the 0-based `offset` with `new_len`
+# bytes written by `write!(data, src)`, moving the bytes after the region.
+# Throw an `ArgumentError` if the record would be too long for BAM (invariant 1),
+# in which case the record is unchanged and `write!` is not called. This is checked
+# before modifying anything.
+#
+# `src` is the input of the setter, as given by `data_indices` (or `nothing` if it
+# does not alias `data`). `write!` gets the index in `data` where the input's bytes
+# currently start, or `nothing`. It must write `new_len` bytes at `offset + 1`, and it
+# must copy aliased input with `unsafe_move_bytes!`, since the input may overlap the
+# region. `write!` is called when the input is intact:
+# * When shrinking, before moving the trailing bytes, so the input has not moved.
+# * When growing, after moving them, since there is no room before. Input before or
+#   inside the region is not moved, and input after it is moved by the growth.
+#   Input that overlaps the end of the region would be split in two by the move;
+#   this is an internal error, and setters must rule it out beforehand.
+#
+# This breaks the invariants of the record: The caller must update the length fields
+# (e.g. `l_read_name`) to match, and `write!` must not throw.
+@inline function replace_region!(
+        write!::F,
+        record::BAMRecord,
+        offset::Int,
+        old_len::Int,
+        new_len::Int,
+        src::Union{Nothing, UnitRange{Int}},
+    )::Nothing where {F}
+    data = record.data
+    old_total = length(data)
+    # TODO: Remove this assert when the package is ready for release.
+    # Its throw is outlined, since an inline `@assert` makes the function set up a GC frame.
+    if !((offset >= 0) & (old_len >= 0) & (new_len >= 0) & (offset + old_len <= old_total))
+        throw_assertion_error("invalid region in replace_region!")
+    end
+    new_total = old_total - old_len + new_len
+    new_total > typemax(UInt32) - BAM_FIXED_BYTES && throw_record_too_long()
+    n_trailing = old_total - offset - old_len
+    region_end = offset + old_len
+    trailing_src = region_end + 1
+    trailing_dst = offset + new_len + 1
+    if new_len <= old_len
+        write!(data, src === nothing ? nothing : first(src))
+        if new_len < old_len
+            unsafe_move_bytes!(data, trailing_dst, trailing_src, n_trailing)
+            resize!(data, new_total)
+        end
+    else
+        moved_src = if src === nothing
+            nothing
+        elseif first(src) > region_end
+            first(src) + (new_len - old_len)
+        else
+            # TODO: Remove this assert when the package is ready for release.
+            last(src) <= region_end || throw_assertion_error("input split by replace_region!")
+            first(src)
+        end
+        resize!(data, new_total)
+        unsafe_move_bytes!(data, trailing_dst, trailing_src, n_trailing)
+        write!(data, moved_src)
+    end
+    return nothing
+end
+
+# Copy `n` bytes of `data` from index `src` to index `dst`, without bounds checking.
+# The regions may overlap, since the copy is a `memmove`.
+# This uses pointers, because slicing `MemoryView`s adds checks for empty slices,
+# which the compiler can't remove.
+@inline function unsafe_move_bytes!(data::Vector{UInt8}, dst::Int, src::Int, n::Int)::Nothing
+    GC.@preserve data unsafe_copyto!(pointer(data, dst), pointer(data, src), n % UInt)
+    return nothing
+end
+
+@noinline throw_assertion_error(msg::String) = throw(AssertionError(msg))
+
+@noinline function throw_record_too_long()
+    throw(ArgumentError("Record would be too long to be represented in BAM"))
+end
+
+"""
+    set_query_name!(record::BAMRecord, name::Union{Nothing, AbstractString})::BAMRecord
+
+Set the query name (QNAME) of `record` to `name`, or to missing if `name` is `nothing`,
+and return `record`.
+Throw an `ArgumentError` if `name` is not a valid name, i.e. if it does not match the
+regex `[!-?A-~]{1,254}` from the SAM specification, or is `"*"`, which denotes
+a missing name. To set a missing name, pass `nothing`.
+
+This moves the rest of the record's data, which is O(n) in the size of the record.
+
+!!! warning
+    `name` must not alias the record's data, except for strings returned by this package,
+    such as [`query_name(record)`](@ref query_name), a string value from
+    [`aux_data(record)`](@ref aux_data), and substrings of these, which are handled.
+
+See also: [`query_name`](@ref)
+"""
+function set_query_name!(record::BAMRecord, name::Union{Nothing, AbstractString})
+    if name === nothing
+        unsafe_set_query_name!(record, "*")
+    else
+        utf8 = to_utf8_string(name)
+        is_valid_query_name(utf8) || throw_invalid_value("Invalid query name", name)
+        unsafe_set_query_name!(record, utf8)
+    end
+    return record
+end
+
+# String types whose code units are UTF-8 bytes. For other string types, code units
+# may be wider than a byte (e.g. UTF-16), or a byte in the ASCII range may not be that
+# ASCII character (e.g. UTF-7), so they must be converted before handling their bytes.
+const UTF8String = Union{String, SubString{String}, StringView, SubString{<:StringView}}
+
+# Return `s` as a `UTF8String`: `s` itself if it is one, else a converted `String`.
+# The conversion is outlined, since it allocates, and other string types are rare.
+to_utf8_string(s::UTF8String) = s
+@noinline to_utf8_string(s::AbstractString)::String = String(s)
+
+# Set the query name to `name`, which must be a valid name, or "*".
+# Strings are passed to this and `is_valid_query_name` instead of their code units,
+# since passing a `CodeUnits` to a function that is not inlined makes the caller set up
+# a GC frame.
+function unsafe_set_query_name!(record::BAMRecord, name::UTF8String)::Nothing
+    bytes = codeunits(name)
+    n = length(bytes)
+    # A view of the data can't overlap the end of the name region, which is the name's
+    # null byte, since a valid name has no null bytes. So `replace_region!` can handle it.
+    src = data_indices(record.data, bytes)
+    replace_region!(record, 0, record.l_read_name % Int, n + 1, src) do data, src_start
+        # Without this, the closure is not inlined for some types of `name`
+        @inline
+        if src_start === nothing
+            for i in 1:n
+                @inbounds data[i] = bytes[i]
+            end
+        else
+            unsafe_move_bytes!(data, 1, src_start, n)
+        end
+        # Invariant 3: The name is null terminated
+        @inbounds data[n + 1] = 0x00
+    end
+    record.l_read_name = (n + 1) % UInt8
+    return nothing
+end
+
+# Check if `name` matches `[!-?A-~]{1,254}`, and is not `*`.
+# A valid name therefore has no null bytes, and its length plus the null byte fits in
+# `l_read_name`.
+function is_valid_query_name(name::UTF8String)::Bool
+    bytes = codeunits(name)
+    in(length(bytes), 1:254) || return false
+    length(bytes) == 1 && @inbounds(bytes[1]) == UInt8('*') && return false
+    for c in bytes
+        (in(c, 0x21:0x7e) & (c != 0x40)) || return false
+    end
+    return true
 end
 
 function cigar(record::BAMRecord)::Union{Nothing, BAMCIGAR, XAMError}
