@@ -885,6 +885,7 @@ end
 # Errors are thrown by outlined functions, since constructing an error inline makes
 # the caller set up a GC frame. See the TODO about this in XAM2.jl.
 @noinline throw_invalid_value(msg::String, value) = throw(ArgumentError(string(msg, ", got ", repr(value))))
+@noinline throw_argument_error(msg::String) = throw(ArgumentError(msg))
 @noinline throw_key_error(key) = throw(KeyError(key))
 
 # Setters for the fixed-length fields of `BAMRecord`.
@@ -904,7 +905,7 @@ See also: [`flags`](@ref)
 """
 function set_flags!(record::BAMRecord, flags::SAMFlags)
     if !(SAMFlag.UNMAP in flags) && !is_placed(record)
-        throw(ArgumentError("Cannot clear the UNMAP flag of a record without a reference and position"))
+        throw_argument_error("Cannot clear the UNMAP flag of a record without a reference and position")
     end
     record.flags = flags
     return record
@@ -965,10 +966,10 @@ end
 
 function set_placement!(record::BAMRecord, ::Nothing)
     if !(SAMFlag.UNMAP in record.flags)
-        throw(ArgumentError("Cannot remove the reference and position of a mapped record"))
+        throw_argument_error("Cannot remove the reference and position of a mapped record")
     end
     if has_placeholder_cigar(record)
-        throw(ArgumentError("Cannot remove the reference of a record with more than 65535 CIGAR operations"))
+        throw_argument_error("Cannot remove the reference of a record with more than 65535 CIGAR operations")
     end
     record.refID = Int32(-1)
     record.pos = Int32(-1)
@@ -1174,7 +1175,7 @@ end
 @noinline throw_assertion_error(msg::String) = throw(AssertionError(msg))
 
 @noinline function throw_record_too_long()
-    throw(ArgumentError("Record would be too long to be represented in BAM"))
+    throw_argument_error("Record would be too long to be represented in BAM")
 end
 
 """
@@ -1227,8 +1228,6 @@ function unsafe_set_query_name!(record::BAMRecord, name::UTF8String)::Nothing
     # null byte, since a valid name has no null bytes. So `replace_region!` can handle it.
     src = data_indices(record.data, bytes)
     replace_region!(record, 0, record.l_read_name % Int, n + 1, src) do data, src_start
-        # Without this, the closure is not inlined for some types of `name`
-        @inline
         if src_start === nothing
             for i in 1:n
                 @inbounds data[i] = bytes[i]
@@ -1302,7 +1301,8 @@ Set the CIGAR of `record` to `cigar`, or to missing if `cigar` is `nothing`, and
 `record`. To set a `CIGARStrings.CIGAR`, convert it with `BAMCIGAR(cigar)` first.
 
 The CIGAR must match the sequence: If `record` has a sequence, the query length of
-`cigar` must equal the length of the sequence.
+`cigar` must equal the length of the sequence. To change both, use
+[`set_cigar_and_sequence!`](@ref).
 
 !!! warning
     This removes any `CG` auxiliary field of `record`. A `CG` field is only meaningful
@@ -1323,7 +1323,7 @@ Throw an `ArgumentError`, leaving the record unchanged, if:
 This moves the rest of the record's data, which is O(n) in the size of the record.
 `cigar` may be a view of the record's own data, e.g. `cigar(record)`.
 
-See also: [`cigar`](@ref)
+See also: [`cigar`](@ref), [`set_cigar_and_sequence!`](@ref)
 """
 function set_cigar!(record::BAMRecord, cig::Union{Nothing, BAMCIGAR})
     if cig === nothing
@@ -1332,7 +1332,7 @@ function set_cigar!(record::BAMRecord, cig::Union{Nothing, BAMCIGAR})
         record.n_cigar_op = 0x0000
     else
         n_ops = length(cig)
-        iszero(n_ops) && throw(ArgumentError("Cannot set an empty CIGAR. To set a missing CIGAR, pass `nothing`"))
+        iszero(n_ops) && throw_argument_error("Cannot set an empty CIGAR. To set a missing CIGAR, pass `nothing`")
         check_cigar_query_length(cig, record.l_seq % Int)
         n_ops > typemax(UInt16) && return set_long_cigar!(record, cig)
         unsafe_set_cigar_field!(record, MemoryView(cig))
@@ -1389,47 +1389,77 @@ function delete_cg_tag!(record::BAMRecord)::Nothing
 end
 
 # Set a CIGAR with more than 65535 operations, which is stored in the CG tag, with the
-# placeholder `kSmN` in the CIGAR field, where k is the sequence length, and m the
-# reference length (see `is_placeholder_cigar`). Outlined, since this is rare.
-# The query length of `cig` has already been checked.
+# placeholder `kSmN` in the CIGAR field (see `store_cigar_placeholder!`).
+# Outlined, since this is rare. The query length of `cig` has already been checked.
 @noinline function set_long_cigar!(record::BAMRecord, cig::BAMCIGAR)::BAMRecord
+    l_seq = record.l_seq % Int
+    check_long_cigar(record, cig, l_seq)
+    old_len = 4 * (record.n_cigar_op % Int)
+    check_long_cigar_fits(record, cig, length(record.data) - old_len + 8)
+    # The edits below move the record's data, so aliased input is copied, e.g. if the
+    # input is the record's current CIGAR stored in the CG tag
+    bytes = unaliased(record.data, MemoryView(cig))
+    offset = cigar_offset(record)
+    ref_len = CIGARStrings.ref_length(cig)
+    replace_region!(record, offset, old_len, 8, nothing) do data, _
+        store_cigar_placeholder!(data, offset, l_seq, ref_len)
+    end
+    record.n_cigar_op = 0x0002
+    replace_cg_tag!(record, bytes)
+    return record
+end
+
+# Throw if a CIGAR with more than 65535 operations can't be stored on `record`, if
+# the record's sequence length is `l_seq`.
+function check_long_cigar(record::BAMRecord, cig::BAMCIGAR, l_seq::Int)::Nothing
     # The placeholder is only recognised on records with a reference
     if record.refID < 0
-        throw(ArgumentError("A CIGAR with more than 65535 operations can only be set on a record with a reference"))
+        throw_argument_error("A CIGAR with more than 65535 operations can only be set on a record with a reference")
     end
-    l_seq = record.l_seq % Int
-    ref_len = CIGARStrings.ref_length(cig)
-    if max(l_seq, ref_len) > 0x0fff_ffff
-        throw(ArgumentError("The lengths of a CIGAR with more than 65535 operations must be less than 2^28"))
+    if max(l_seq, CIGARStrings.ref_length(cig)) > 0x0fff_ffff
+        throw_argument_error("The lengths of a CIGAR with more than 65535 operations must be less than 2^28")
     end
     # A CG tag in malformed auxiliary data would not be read by `load_aux_cigar`
     if aux_data(record) isa XAMError
-        throw(ArgumentError("A CIGAR with more than 65535 operations can't be set on a record with malformed auxiliary data"))
+        throw_argument_error("A CIGAR with more than 65535 operations can't be set on a record with malformed auxiliary data")
     end
-    bytes = MemoryView(cig)
-    data = record.data
-    # Check the length before modifying anything. This ignores the removal of an
-    # existing CG tag, so it may reject records that would barely fit.
-    n_ops = length(cig)
-    new_total = length(data) - 4 * (record.n_cigar_op % Int) + 8 + CG_HEADER_BYTES + 4 * n_ops
-    new_total > typemax(UInt32) - BAM_FIXED_BYTES && throw_record_too_long()
-    # The edits below move the record's data, so aliased input is copied, e.g. if the
-    # input is the record's current CIGAR stored in the CG tag
-    if data_indices(data, bytes) !== nothing
-        bytes = copy(bytes)
-    end
-    offset = cigar_offset(record)
-    replace_region!(record, offset, 4 * (record.n_cigar_op % Int), 8, nothing) do data, _
-        mem = MemoryView(data)
-        inbounds_store_le!(mem, offset + 1, ((l_seq % UInt32) << 4) | 0x04) # S
-        inbounds_store_le!(mem, offset + 5, ((ref_len % UInt32) << 4) | 0x03) # N
-    end
-    record.n_cigar_op = 0x0002
-    # The auxiliary data was checked above, and moving it doesn't change it
-    delete!(aux_data_unchecked(record), "CG")
-    copyto!(append_cg_header!(data, n_ops), bytes)
-    return record
+    return nothing
 end
+
+# Throw if the record would be too long after appending a CG tag holding `cig`, where
+# `len` is the length of the data before appending. Checked before modifying anything.
+# This ignores the removal of an existing CG tag, so it may reject records that would
+# barely fit.
+function check_long_cigar_fits(record::BAMRecord, cig::BAMCIGAR, len::Int)::Nothing
+    new_total = len + CG_HEADER_BYTES + 4 * length(cig)
+    new_total > typemax(UInt32) - BAM_FIXED_BYTES && throw_record_too_long()
+    return nothing
+end
+
+# Store the placeholder CIGAR `kSmN` after the 0-based `offset`, where k is the sequence
+# length, and m the reference length (see `is_placeholder_cigar`).
+function store_cigar_placeholder!(data::Vector{UInt8}, offset::Int, l_seq::Int, ref_len::Int)::Nothing
+    mem = MemoryView(data)
+    inbounds_store_le!(mem, offset + 1, ((l_seq % UInt32) << 4) | 0x04) # S
+    inbounds_store_le!(mem, offset + 5, ((ref_len % UInt32) << 4) | 0x03) # N
+    return nothing
+end
+
+# Replace any CG tag with one holding `bytes`, the encoding of a CIGAR.
+# The auxiliary data must be well-formed, and `bytes` must not alias the record's data.
+function replace_cg_tag!(record::BAMRecord, bytes::ImmutableMemoryView{UInt8})::Nothing
+    delete!(aux_data_unchecked(record), "CG")
+    copyto!(append_cg_header!(record.data, length(bytes) >>> 2), bytes)
+    return nothing
+end
+
+# Return `x`, or a copy of it if it aliases `data`.
+# The copy is outlined, since it allocates, and aliasing is rare.
+@inline function unaliased(data::Vector{UInt8}, x::ImmutableMemoryView{UInt8})::ImmutableMemoryView{UInt8}
+    return data_indices(data, x) === nothing ? x : copy_outlined(x)
+end
+
+@noinline copy_outlined(x) = copy(x)
 
 # Bytes of a CG tag before its array: tag, type 'B', element type 'I', and count
 const CG_HEADER_BYTES = 8
@@ -1443,6 +1473,224 @@ function append_cg_header!(data::Vector{UInt8}, n_ops::Int)::MutableMemoryView{U
     copyto!(mem, b"CGBI")
     inbounds_store_le!(mem, 5, n_ops % UInt32)
     return mem[(CG_HEADER_BYTES + 1):end]
+end
+
+# Sequence and quality setters.
+# The sequence input is normalized to `nothing`, a `BAMSeq` whose packed bytes are
+# copied, or a `UTF8String`, whose bytes are encoded. Their code units are a
+# `MemoryView` for `StringView`s and their substrings, so they are checked for aliasing.
+# Strings are passed instead of their code units, since passing a `CodeUnits` to a
+# function that is not inlined allocates (see `unsafe_set_query_name!`).
+# The quality input is normalized to `nothing`, an `ImmutableMemoryView` if possible
+# (so it can be checked for aliasing, and copied without bounds checks), or else left as is.
+normalize_seq(::Nothing) = nothing
+normalize_seq(seq::BAMSeq) = seq
+normalize_seq(seq::AbstractString) = to_utf8_string(seq)
+
+normalize_qual(::Nothing) = nothing
+normalize_qual(qual::Union{DataView, Vector{UInt8}, Memory{UInt8}}) = ImmutableMemoryView(qual)
+normalize_qual(qual::AbstractVector{UInt8}) = qual
+
+seq_length(::Nothing) = 0
+seq_length(seq::BAMSeq) = ncodeunits(seq)
+seq_length(seq::UTF8String) = ncodeunits(seq)
+
+# Check the sequence and quality input, and return the sequence length.
+function check_seq_qual(seq, qual::Union{Nothing, AbstractVector{UInt8}})::Int
+    if seq === nothing
+        qual === nothing || throw_argument_error("A record without a sequence can't have quality scores")
+        return 0
+    end
+    n = seq_length(seq)
+    iszero(n) && throw_argument_error("Cannot set an empty sequence. To set a missing sequence, pass `nothing`")
+    if seq isa UTF8String
+        for byte in codeunits(seq)
+            # Branchless: The mask keeps the index in bounds, and the comparison
+            # rejects the bytes it changes
+            ok = (byte < 0x80) & (@inbounds(STRICT_ENCODE_LUT[(byte & 0x7f) + 1]) != 0xff)
+            ok || throw_invalid_value("Sequence can only contain the characters `=ACMGRSVTWYHKDBN` and their lowercase", Char(byte))
+        end
+    end
+    if qual !== nothing
+        length(qual) == n || throw_qual_length_mismatch(length(qual), n)
+        for q in qual
+            # The scores SAM can represent, as the printable characters `!` to `~`
+            q > 0x5d && throw_invalid_value("Quality scores must be in 0:93", Int(q))
+        end
+    end
+    return n
+end
+
+@noinline function throw_qual_length_mismatch(qual_len::Int, n::Int)
+    throw(ArgumentError(lazy"Length of quality scores, $qual_len, differs from sequence length $n"))
+end
+
+# Return the inputs, copying those that alias `data`.
+function unaliased_seq_qual(data::Vector{UInt8}, seq, qual)
+    seq = if seq isa BAMSeq
+        data_indices(data, seq.data) === nothing ? seq : BAMSeq(copy_outlined(seq.data), seq.len)
+    elseif seq isa UTF8String && data_indices(data, codeunits(seq)) !== nothing
+        StringView(copy_outlined(ImmutableMemoryView(codeunits(seq))))
+    else
+        seq
+    end
+    qual = qual isa ImmutableMemoryView{UInt8} ? unaliased(data, qual) : qual
+    return (seq, qual)
+end
+
+# Number of bytes of the encoded sequence and quality of length `n`
+seq_qual_bytes(n::Int) = cld(n, 2) + n
+
+# Write the sequence of length `n` and its quality after the 0-based `offset`.
+# The input must have been checked, and must not alias `data`.
+function write_seq_qual!(data::Vector{UInt8}, offset::Int, seq, qual, n::Int)::Nothing
+    seq === nothing && return nothing
+    mem = MemoryView(data)
+    n_seq_bytes = cld(n, 2)
+    seq_mem = @inbounds mem[(offset + 1):(offset + n_seq_bytes)]
+    if seq isa BAMSeq
+        # Invariant of `BAMSeq`: Its data has `n_seq_bytes` bytes
+        @inbounds copyto!(seq_mem, seq.data)
+    else
+        # Like `bamseq!`, but the input has already been checked
+        fill!(seq_mem, 0x00)
+        bytes = codeunits(seq)
+        for i in 1:n
+            byte = @inbounds bytes[i]
+            encoding = @inbounds STRICT_ENCODE_LUT[byte + 1]
+            @inbounds seq_mem[(i + 1) >>> 1] |= encoding << ((4 * isodd(i)) & 7)
+        end
+    end
+    qual_mem = @inbounds mem[(offset + n_seq_bytes + 1):(offset + n_seq_bytes + n)]
+    if qual === nothing
+        # Missing quality is encoded as all 0xff
+        fill!(qual_mem, 0xff)
+    else
+        # The length of `qual` was checked to be `n`
+        @inbounds copyto!(qual_mem, qual)
+    end
+    return nothing
+end
+
+"""
+    set_sequence!(
+        record::BAMRecord,
+        seq::Union{Nothing, AbstractString},
+        qual::Union{Nothing, AbstractVector{UInt8}},
+    )::BAMRecord
+
+Set the sequence (SEQ) of `record` to `seq`, and its quality scores (QUAL) to `qual`,
+and return `record`. `seq` may be `nothing` for a missing sequence, and `qual` may be
+`nothing` for missing quality scores.
+
+`seq` may contain the characters `=ACMGRSVTWYHKDBN`, i.e. `=` and the IUPAC nucleotide
+codes, which are the characters BAM can store. Lowercase letters are accepted, and
+stored as uppercase.
+`qual` holds PHRED scores without offset, like the return value of
+[`quality_scores`](@ref).
+
+If `record` has a CIGAR, the length of the sequence can't be changed, since it must
+match the CIGAR. To change both, use [`set_cigar_and_sequence!`](@ref).
+
+Throw an `ArgumentError`, leaving the record unchanged, if:
+* `seq` is empty, or contains other characters than `=ACMGRSVTWYHKDBN` and their
+  lowercase. To set a missing sequence, pass `nothing`.
+* `qual` is not `nothing`, and `seq` is `nothing`, or `qual` has a different length
+  than `seq`, or `qual` contains a score above 93, which SAM can't represent.
+* `record` has a CIGAR, and the length of `seq` differs from the current sequence length
+  (including setting a sequence on a record with a missing sequence, or vice versa).
+* The record would be too long to be represented in BAM (about 2 GB).
+
+This moves the rest of the record's data, if the length changes.
+
+See also: [`sequence`](@ref), [`quality_scores`](@ref), [`set_cigar_and_sequence!`](@ref)
+"""
+function set_sequence!(
+        record::BAMRecord,
+        seq::Union{Nothing, AbstractString},
+        qual::Union{Nothing, AbstractVector{UInt8}},
+    )
+    s = normalize_seq(seq)
+    q = normalize_qual(qual)
+    n = check_seq_qual(s, q)
+    l_seq = record.l_seq % Int
+    if !iszero(record.n_cigar_op) && n != l_seq
+        throw_argument_error("Cannot change the sequence length of a record with a CIGAR. Use `set_cigar_and_sequence!`")
+    end
+    # New names, since reassigned captured variables are boxed
+    (seq_in, qual_in) = unaliased_seq_qual(record.data, s, q)
+    offset = seq_offset(record)
+    replace_region!(record, offset, seq_qual_bytes(l_seq), seq_qual_bytes(n), nothing) do data, _
+        write_seq_qual!(data, offset, seq_in, qual_in, n)
+    end
+    record.l_seq = n % UInt32
+    return record
+end
+
+"""
+    set_cigar_and_sequence!(
+        record::BAMRecord,
+        cigar::Union{Nothing, BAMCIGAR},
+        seq::Union{Nothing, AbstractString},
+        qual::Union{Nothing, AbstractVector{UInt8}},
+    )::BAMRecord
+
+Set the CIGAR, sequence and quality scores of `record` together, and return `record`.
+This is needed to change the length of the sequence of a record with a CIGAR, e.g.
+when trimming a read. The arguments are as in [`set_cigar!`](@ref) and
+[`set_sequence!`](@ref), and if both `cigar` and `seq` are given, the query length of
+`cigar` must equal the length of `seq`.
+
+Throws like [`set_cigar!`](@ref) and [`set_sequence!`](@ref), except that the sequence
+length may change. This removes any `CG` auxiliary field, like `set_cigar!`.
+
+This moves the rest of the record's data once, which is O(n) in the size of the record.
+
+See also: [`set_cigar!`](@ref), [`set_sequence!`](@ref)
+"""
+function set_cigar_and_sequence!(
+        record::BAMRecord,
+        cig::Union{Nothing, BAMCIGAR},
+        seq::Union{Nothing, AbstractString},
+        qual::Union{Nothing, AbstractVector{UInt8}},
+    )
+    s = normalize_seq(seq)
+    q = normalize_qual(qual)
+    n = check_seq_qual(s, q)
+    data = record.data
+    old_len = 4 * (record.n_cigar_op % Int) + seq_qual_bytes(record.l_seq % Int)
+    # Variables captured by the closure below are assigned only once, since
+    # reassigned captured variables are boxed
+    is_long = cig !== nothing && length(cig) > typemax(UInt16)
+    if cig !== nothing
+        iszero(length(cig)) && throw_argument_error("Cannot set an empty CIGAR. To set a missing CIGAR, pass `nothing`")
+        check_cigar_query_length(cig, n)
+        if is_long
+            check_long_cigar(record, cig, n)
+            check_long_cigar_fits(record, cig, length(data) - old_len + 8 + seq_qual_bytes(n))
+        end
+    end
+    cig_bytes = cig === nothing ? nothing : unaliased(data, MemoryView(cig))
+    ref_len = is_long ? CIGARStrings.ref_length(something(cig)) : 0
+    (seq_in, qual_in) = unaliased_seq_qual(data, s, q)
+    cig_len = cig_bytes === nothing ? 0 : is_long ? 8 : length(cig_bytes)
+    offset = cigar_offset(record)
+    replace_region!(record, offset, old_len, cig_len + seq_qual_bytes(n), nothing) do data, _
+        if is_long
+            store_cigar_placeholder!(data, offset, n, ref_len)
+        elseif cig_bytes !== nothing
+            GC.@preserve data cig_bytes unsafe_copyto!(pointer(data, offset + 1), pointer(cig_bytes), cig_len % UInt)
+        end
+        write_seq_qual!(data, offset + cig_len, seq_in, qual_in, n)
+    end
+    record.n_cigar_op = (cig_len >>> 2) % UInt16
+    record.l_seq = n % UInt32
+    if is_long
+        replace_cg_tag!(record, something(cig_bytes))
+    else
+        delete_cg_tag!(record)
+    end
+    return record
 end
 
 function unsafe_load_fixed_fields(record::BAMRecord, buffer::ImmutableMemoryView{UInt8})

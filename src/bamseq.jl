@@ -1,4 +1,5 @@
 struct BAMSeq <: AbstractString
+    # Invariant: `length(data) == cld(len, 2)`
     data::ImmutableMemoryView{UInt8}
     # Each byte stores two characters, so we need this field
     # to distinguish an odd from an even length
@@ -16,6 +17,19 @@ const ENCODE_LUT = let
     for char in ['A':'Z'; 'a':'z'; '.']
         result[Int(char) + 1] = 0x0f
     end
+    for (i, char) in enumerate("=ACMGRSVTWYHKDBN")
+        encoding = i - 1
+        for c in [char, lowercase(char)]
+            result[Int(c) + 1] = encoding
+        end
+    end
+    Tuple(result)
+end
+
+# Like `ENCODE_LUT`, but only the 16 BAM codes (and their lowercase) are valid.
+# Used by setters, where other letters are more likely a bug than an intended `N`.
+const STRICT_ENCODE_LUT = let
+    result = fill(0xff, 128)
     for (i, char) in enumerate("=ACMGRSVTWYHKDBN")
         encoding = i - 1
         for c in [char, lowercase(char)]

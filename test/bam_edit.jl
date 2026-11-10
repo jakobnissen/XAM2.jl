@@ -287,3 +287,111 @@ end
     @test query_name(set_query_name!(record, EncodedString(collect(b"a+ACY-b"), collect("a&b")))) == "a&b"
     @test query_name(set_query_name!(record, Test.GenericString("read_2"))) == "read_2"
 end
+
+@testset "Sequence setters" begin
+    refs = References(["chr1"], [10^9])
+    header = parse_header("@SQ\tSN:chr1\tLN:1000000000")
+    function make_record(cigar, seq, qual = "*"; aux = ["NM:i:1"])
+        fields = ["r", "0", "chr1", "5", "60", cigar, "*", "0", "0", seq, qual, aux...]
+        return try_sam_to_bam(sam_line(fields), refs)::BAMRecord
+    end
+    roundtrip(r) = only(read_bam(write_bam(mktempdir(), [r], header, refs)))
+    bam(s) = BAMCIGAR(CIGAR(s))
+    phred(s) = s == "*" ? nothing : [UInt8(c) - 0x21 for c in s]
+
+    # Without a CIGAR, any length can be set. Compare with records built from SAM.
+    cases = [("A", "I"), ("AC", "*"), ("ACG", "!#I"), ("ACGTN", "*"), ("*", "*"), ("=ACGTRYKMSWBDHVN", "!"^16)]
+    for (seq0, qual0) in cases, (seq, qual) in cases
+        record = make_record("*", seq0, qual0)
+        s = seq == "*" ? nothing : seq
+        @test set_sequence!(record, s, phred(qual)) === record
+        @test record == make_record("*", seq, qual)
+        @test roundtrip(record) == record
+    end
+
+    # Lowercase is stored as uppercase
+    record = make_record("*", "*")
+    set_sequence!(record, "acgT=mrsvwyhkdbn", nothing)
+    @test sequence(record) == "ACGT=MRSVWYHKDBN"
+
+    # A sequence from another record, also with odd length, and non-String strings
+    for seq in ["ACGTA", "ACGT"]
+        record = make_record("*", "*")
+        set_sequence!(record, sequence(make_record("*", seq)), nothing)
+        @test sequence(record) == seq
+        set_sequence!(record, SubString(seq, 2), nothing)
+        @test sequence(record) == seq[2:end]
+        set_sequence!(record, SubString(sequence(make_record("*", seq)), 2), nothing)
+        @test sequence(record) == seq[2:end]
+    end
+
+    # Invalid input throws, and leaves the record unchanged
+    record = make_record("3M", "ACG", "III")
+    before = copy(record)
+    for (seq, qual) in [
+            ("", nothing), ("AC GT", nothing), ("ACé", nothing), ("AC1", nothing),
+            # Letters that are not IUPAC codes, and `.`, which are accepted when parsing SAM
+            ("ACX", nothing), ("ACx", nothing), ("AC.", nothing), ("ACU", nothing),
+            (nothing, UInt8[]), ("ACG", UInt8[1, 2]), ("ACG", UInt8[1, 2, 94]),
+            # The length of a record with a CIGAR can't change
+            ("ACGT", nothing), (nothing, nothing),
+        ]
+        @test_throws ArgumentError set_sequence!(record, seq, qual)
+        @test record == before
+    end
+    # The same length is fine
+    set_sequence!(record, "TTT", UInt8[93, 0, 1])
+    @test record == make_record("3M", "TTT", "~!\"")
+    # A record with a CIGAR, but no sequence, can't get a sequence
+    record = make_record("3M", "*")
+    @test_throws ArgumentError set_sequence!(record, "ACG", nothing)
+
+    # Aliased input: the record's own sequence and quality, and an aux array
+    record = make_record("*", "ACGTA", "ABCDE")
+    set_sequence!(record, sequence(record), quality_scores(record))
+    @test record == make_record("*", "ACGTA", "ABCDE")
+    set_sequence!(record, SubString(sequence(record), 2), quality_scores(record)[2:end])
+    @test record == make_record("*", "CGTA", "BCDE")
+    record = make_record("*", "A", "I"; aux = ["XQ:B:C,1,2,3,4,5,6,7", "NM:i:1"])
+    set_sequence!(record, "ACGTACG", aux_data(record)["XQ"])
+    @test record == make_record("*", "ACGTACG", "\"#\$%&'("; aux = ["XQ:B:C,1,2,3,4,5,6,7", "NM:i:1"])
+    set_sequence!(record, "AC", aux_data(record)["XQ"][3:4])
+    @test record == make_record("*", "AC", "\$%"; aux = ["XQ:B:C,1,2,3,4,5,6,7", "NM:i:1"])
+
+    # Setting the CIGAR and sequence together, e.g. trimming
+    record = make_record("2S3M1I", "ACGTAC", "ABCDEF")
+    @test set_cigar_and_sequence!(record, bam("3M"), SubString(sequence(record), 3, 5), quality_scores(record)[3:5]) === record
+    @test record == make_record("3M", "GTA", "CDE")
+    @test roundtrip(record) == record
+    set_cigar_and_sequence!(record, bam("1M2I5M"), "ACGTACGT", nothing)
+    @test record == make_record("1M2I5M", "ACGTACGT")
+    set_cigar_and_sequence!(record, bam("4M"), nothing, nothing)
+    @test record == make_record("4M", "*")
+    set_cigar_and_sequence!(record, nothing, nothing, nothing)
+    @test record == make_record("*", "*")
+    set_cigar_and_sequence!(record, nothing, "AC", nothing)
+    @test record == make_record("*", "AC")
+
+    # Invalid input throws, and leaves the record unchanged
+    record = make_record("3M", "ACG", "III")
+    before = copy(record)
+    @test_throws ArgumentError set_cigar_and_sequence!(record, bam("4M"), "ACG", nothing)
+    @test_throws ArgumentError set_cigar_and_sequence!(record, BAMCIGAR(UInt8[]), "ACG", nothing)
+    @test_throws ArgumentError set_cigar_and_sequence!(record, bam("2M"), "AC", UInt8[1])
+    @test record == before
+
+    # Long CIGARs, and removal of the CG tag
+    n = 70_000
+    long = bam("1M1I"^n)
+    record = make_record("3M", "ACG")
+    set_cigar_and_sequence!(record, long, "A"^(2n), nothing)
+    @test XAM2.cigar(record) == long
+    @test sequence(record) == "A"^(2n)
+    @test aux_data(record)["NM"] == 1
+    @test roundtrip(record) == record
+    set_cigar_and_sequence!(record, XAM2.cigar(record), "C"^(2n), nothing)
+    @test XAM2.cigar(record) == long
+    @test sequence(record) == "C"^(2n)
+    set_cigar_and_sequence!(record, bam("3M"), "ACG", nothing)
+    @test record == make_record("3M", "ACG")
+end
