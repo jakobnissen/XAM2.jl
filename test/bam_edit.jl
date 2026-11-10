@@ -19,16 +19,12 @@ end
     record = BAMRecord(refs)
 
     # Setters return the record, and getters return what was set
-    flags = SAMFlags([SAMFlag.PAIRED, SAMFlag.READ1])
+    flags = SAMFlags([SAMFlag.PAIRED, SAMFlag.READ1, SAMFlag.UNMAP])
     @test set_flags!(record, flags) === record
     @test XAM2.flags(record) == flags
 
     for (set!, get, values) in [
             (set_mapping_quality!, mapping_quality, [0, 60, 254, nothing]),
-            (set_left_position!, left_position, [1, 17, typemax(Int32), nothing]),
-            (set_next_position!, next_position, [1, 17, typemax(Int32), nothing]),
-            (set_reference!, reference_index, [1, 2, nothing]),
-            (set_next_reference!, next_reference_index, [1, 2, nothing]),
             (set_template_length!, template_length, [1, -1, typemin(Int32), typemax(Int32), nothing]),
         ]
         for value in values
@@ -37,37 +33,142 @@ end
         end
     end
 
-    # References by name
-    set_reference!(record, "chr2")
-    @test reference_name(record) == "chr2"
-    set_next_reference!(record, "chr1")
-    @test next_reference_name(record) == "chr1"
+    # Placement, by index or name
+    for (set!, get_ref, get_pos) in [
+            (set_placement!, reference_index, left_position),
+            (set_next_placement!, next_reference_index, next_position),
+        ]
+        for (ref, pos) in [(1, 1), (2, 17), ("chr1", 1000), ("chr2", 500)]
+            @test set!(record, ref, pos) === record
+            @test get_ref(record) == (ref isa String ? (ref == "chr1" ? 1 : 2) : ref)
+            @test get_pos(record) == pos
+        end
+        @test set!(record, nothing) === record
+        @test get_ref(record) === nothing
+        @test get_pos(record) === nothing
+    end
 
     # Invalid input throws, and leaves the record unchanged
+    set_placement!(record, 1, 10)
     before = copy(record)
     @test_throws ArgumentError set_mapping_quality!(record, 255)
     @test_throws ArgumentError set_mapping_quality!(record, -1)
-    @test_throws ArgumentError set_left_position!(record, 0)
-    @test_throws ArgumentError set_left_position!(record, typemax(Int32) + 1)
-    @test_throws ArgumentError set_next_position!(record, -1)
-    @test_throws BoundsError set_reference!(record, 0)
-    @test_throws BoundsError set_reference!(record, 3)
-    @test_throws KeyError set_reference!(record, "chr3")
-    @test_throws KeyError set_next_reference!(record, "chr3")
+    for set! in [set_placement!, set_next_placement!]
+        @test_throws ArgumentError set!(record, 1, 0)
+        @test_throws ArgumentError set!(record, 1, typemax(Int32) + 1)
+        @test_throws ArgumentError set!(record, 1, 1001)
+        @test_throws ArgumentError set!(record, "chr2", 501)
+        @test_throws BoundsError set!(record, 0, 1)
+        @test_throws BoundsError set!(record, 3, 1)
+        @test_throws KeyError set!(record, "chr3", 1)
+    end
     @test_throws ArgumentError set_template_length!(record, 0)
     @test_throws ArgumentError set_template_length!(record, typemax(Int32) + 1)
     @test record == before
 
+    # A mapped record can't be unplaced, and an unplaced record can't be mapped
+    mapped = SAMFlags([SAMFlag.PAIRED])
+    set_flags!(record, mapped)
+    @test_throws ArgumentError set_placement!(record, nothing)
+    set_flags!(record, flags)
+    set_placement!(record, nothing)
+    before = copy(record)
+    @test_throws ArgumentError set_flags!(record, mapped)
+    @test record == before
+    # Other flags can be changed on an unplaced record
+    set_flags!(record, SAMFlags([SAMFlag.UNMAP]))
+
+    # A record that is already mapped and unplaced can't keep that state
+    broken = try_sam_to_bam(sam_line(["r", "0", "*", "0", "255", "*", "*", "0", "0", "*", "*"]), refs)::BAMRecord
+    @test_throws ArgumentError set_flags!(broken, SAMFlags([SAMFlag.DUP]))
+    @test set_flags!(broken, SAMFlags([SAMFlag.UNMAP])) === broken
+
     # An edited record survives writing and reading
-    set_flags!(record, SAMFlags([SAMFlag.PAIRED]))
-    set_reference!(record, "chr1")
-    set_left_position!(record, 100)
+    set_placement!(record, "chr1", 100)
+    set_flags!(record, mapped)
     set_mapping_quality!(record, 30)
-    set_next_reference!(record, 2)
-    set_next_position!(record, 50)
+    set_next_placement!(record, 2, 50)
     set_template_length!(record, -250)
     written = only(read_bam(write_bam(mktempdir(), [record], header, refs)))
     @test written == record
+end
+
+@testset "CIGAR setter" begin
+    refs = References(["chr1"], [10^9])
+    header = parse_header("@SQ\tSN:chr1\tLN:1000000000")
+    function make_record(cigar, seq; aux = ["NM:i:1"])
+        fields = ["r", "0", "chr1", "5", "60", cigar, "*", "0", "0", seq, "*", aux...]
+        return try_sam_to_bam(sam_line(fields), refs)::BAMRecord
+    end
+    roundtrip(r) = only(read_bam(write_bam(mktempdir(), [r], header, refs)))
+    bam(s) = BAMCIGAR(CIGAR(s))
+
+    # Grow, shrink, keep length, remove, and add
+    record = make_record("4M", "ACGT")
+    for new in ["2M1I1M", "1S2M2D1M", "4M", nothing, "4=", "1X3M"]
+        cig = new === nothing ? nothing : bam(new)
+        @test set_cigar!(record, cig) === record
+        @test XAM2.cigar(record) == cig
+        @test sequence(record) == "ACGT"
+        @test aux_data(record)["NM"] == 1
+        @test roundtrip(record) == record
+    end
+
+    # A record without a sequence takes any CIGAR
+    record = make_record("*", "*")
+    set_cigar!(record, bam("10M"))
+    @test XAM2.cigar(record) == bam("10M")
+
+    # Invalid input throws, and leaves the record unchanged
+    record = make_record("4M", "ACGT")
+    before = copy(record)
+    @test_throws ArgumentError set_cigar!(record, bam("5M"))
+    @test_throws ArgumentError set_cigar!(record, BAMCIGAR(UInt8[]))
+    @test record == before
+
+    # Aliased input: the record's own CIGAR, and a CIGAR stored in an aux array
+    record = make_record("2M1I1M", "ACGT")
+    set_cigar!(record, XAM2.cigar(record))
+    @test XAM2.cigar(record) == bam("2M1I1M")
+    @test record == make_record("2M1I1M", "ACGT")
+    xc = join(reinterpret(UInt32, collect(MemoryView(bam("1M1I1M1I")))), ',')
+    record = make_record("4M", "ACGT"; aux = ["XC:B:I,$xc"])
+    set_cigar!(record, BAMCIGAR(parent(aux_data(record)["XC"])))
+    @test XAM2.cigar(record) == bam("1M1I1M1I")
+    @test roundtrip(record) == record
+
+    # A stale CG tag is removed
+    record = make_record("4M", "ACGT"; aux = ["CG:B:I,64", "NM:i:1"])
+    set_cigar!(record, bam("4M"))
+    @test !haskey(aux_data(record), "CG")
+    @test aux_data(record)["NM"] == 1
+
+    # Long CIGARs are stored in the CG tag
+    n = 70_000
+    long = bam("1M1I"^n)
+    record = make_record("*", "A"^(2n))
+    set_cigar!(record, long)
+    @test XAM2.cigar(record) == long
+    @test record.n_cigar_op == 2
+    @test aux_data(record)["NM"] == 1
+    @test roundtrip(record) == record
+    # Setting the CIGAR from the CG tag itself, and replacing it with another long CIGAR
+    set_cigar!(record, XAM2.cigar(record))
+    @test XAM2.cigar(record) == long
+    long2 = bam("2M2I"^(n ÷ 2))
+    set_cigar!(record, long2)
+    @test XAM2.cigar(record) == long2
+    @test length(collect(aux_data(record))) == 2
+    # The placeholder makes unplacing throw
+    set_flags!(record, SAMFlags([SAMFlag.UNMAP]))
+    @test_throws ArgumentError set_placement!(record, nothing)
+    # Replacing with a short CIGAR removes the CG tag
+    set_cigar!(record, bam("$(2n)M"))
+    @test XAM2.cigar(record) == bam("$(2n)M")
+    @test !haskey(aux_data(record), "CG")
+    set_placement!(record, nothing)
+    # Long CIGARs need a reference
+    @test_throws ArgumentError set_cigar!(record, long)
 end
 
 @testset "Query name setter" begin

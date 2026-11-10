@@ -896,13 +896,21 @@ end
     set_flags!(record::BAMRecord, flags::SAMFlags)::BAMRecord
 
 Set the flags of `record`, and return `record`.
+Throw an `ArgumentError` if `flags` lacks the `UNMAP` flag, and the record is not
+placed (see [`set_placement!`](@ref)), since a mapped record must have a reference and
+position. To map an unplaced record, set its placement first.
 
 See also: [`flags`](@ref)
 """
 function set_flags!(record::BAMRecord, flags::SAMFlags)
+    if !(SAMFlag.UNMAP in flags) && !is_placed(record)
+        throw(ArgumentError("Cannot clear the UNMAP flag of a record without a reference and position"))
+    end
     record.flags = flags
     return record
 end
+
+is_placed(record::BAMRecord) = (record.refID >= 0) & (record.pos >= 0)
 
 """
     set_mapping_quality!(record::BAMRecord, mapq::Union{Nothing, Integer})::BAMRecord
@@ -925,81 +933,98 @@ function set_mapping_quality!(record::BAMRecord, mapq::Union{Nothing, Integer})
 end
 
 """
-    set_left_position!(record::BAMRecord, pos::Union{Nothing, Integer})::BAMRecord
+    set_placement!(record::BAMRecord, ref::Union{Integer, AbstractString}, pos::Integer)::BAMRecord
+    set_placement!(record::BAMRecord, nothing)::BAMRecord
 
-Set the 1-based leftmost mapped position (POS) of `record` to `pos`, or to missing if
-`pos` is `nothing`, and return `record`.
-Throw an `ArgumentError` if `pos` is not in `1:typemax(Int32)`.
+Set the reference (RNAME) and 1-based leftmost position (POS) of `record`, and return
+`record`. With `nothing`, remove both, making the record unplaced.
 
-The position is not checked against the length of the reference, nor against the CIGAR,
-so it may be set before or after the reference.
+`ref` may be a 1-based index into [`references(record)`](@ref references), like the one
+returned by [`reference_index`](@ref), or the name of a reference.
+`pos` must be within the reference. The end of the alignment is not checked against
+the length of the reference, since it depends on the CIGAR.
 
-See also: [`left_position`](@ref), [`set_reference!`](@ref)
+Throw, leaving the record unchanged:
+* A `BoundsError` if `ref` is an out-of-bounds index, or a `KeyError` if no
+  reference has the name `ref`.
+* An `ArgumentError` if `pos` is not in `1:len`, where `len` is the length of the
+  reference.
+* An `ArgumentError` when removing the placement of a record that does not have the
+  `UNMAP` flag, since a mapped record must have a reference and position, or of a
+  record with a CIGAR of more than 65535 operations, which BAM can only store on a
+  record with a reference.
+
+See also: [`reference_index`](@ref), [`left_position`](@ref), [`set_next_placement!`](@ref)
 """
-function set_left_position!(record::BAMRecord, pos::Union{Nothing, Integer})
-    record.pos = bam_position(pos)
+function set_placement!(record::BAMRecord, ref::Union{Integer, AbstractString}, pos::Integer)
+    ref_id = bam_reference_id(record.refs, ref)
+    record.pos = bam_position(record.refs, ref_id, pos)
+    record.refID = ref_id
     return record
 end
 
-"""
-    set_next_position!(record::BAMRecord, pos::Union{Nothing, Integer})::BAMRecord
-
-Set the 1-based leftmost position of the next segment in the template (PNEXT) of
-`record` to `pos`, or to missing if `pos` is `nothing`, and return `record`.
-Throw an `ArgumentError` if `pos` is not in `1:typemax(Int32)`.
-
-See also: [`next_position`](@ref), [`set_left_position!`](@ref)
-"""
-function set_next_position!(record::BAMRecord, pos::Union{Nothing, Integer})
-    record.next_pos = bam_position(pos)
+function set_placement!(record::BAMRecord, ::Nothing)
+    if !(SAMFlag.UNMAP in record.flags)
+        throw(ArgumentError("Cannot remove the reference and position of a mapped record"))
+    end
+    if has_placeholder_cigar(record)
+        throw(ArgumentError("Cannot remove the reference of a record with more than 65535 CIGAR operations"))
+    end
+    record.refID = Int32(-1)
+    record.pos = Int32(-1)
     return record
 end
 
-# The 0-based BAM position of a 1-based position, or -1 if missing.
+# If the CIGAR field is the placeholder for a CIGAR stored in the CG tag
+function has_placeholder_cigar(record::BAMRecord)::Bool
+    span = (cigar_offset(record) + 1):seq_offset(record)
+    return is_placeholder_cigar(record, @inbounds ImmutableMemoryView(record.data)[span])
+end
+
+"""
+    set_next_placement!(record::BAMRecord, ref::Union{Integer, AbstractString}, pos::Integer)::BAMRecord
+    set_next_placement!(record::BAMRecord, nothing)::BAMRecord
+
+Set the reference (RNEXT) and 1-based leftmost position (PNEXT) of the next segment in
+the template of `record`, and return `record`. With `nothing`, remove both.
+`ref` and `pos` are as in [`set_placement!`](@ref), and throw likewise.
+
+The flags are not checked or changed. Make sure that when setting or clearing placement,
+the MUNMAP and MREVERSE flags are correctly set.
+
+See also: [`next_reference_index`](@ref), [`next_position`](@ref)
+"""
+function set_next_placement!(record::BAMRecord, ref::Union{Integer, AbstractString}, pos::Integer)
+    ref_id = bam_reference_id(record.refs, ref)
+    record.next_pos = bam_position(record.refs, ref_id, pos)
+    record.next_refID = ref_id
+    return record
+end
+
+function set_next_placement!(record::BAMRecord, ::Nothing)
+    record.next_refID = Int32(-1)
+    record.next_pos = Int32(-1)
+    return record
+end
+
+# The 0-based BAM position of a 1-based position.
 # Invariant: The result is in `BAM_POSITIONS`.
-function bam_position(pos::Union{Nothing, Integer})::Int32
-    pos === nothing && return Int32(-1)
-    in(pos, 1:typemax(Int32)) || throw_invalid_value("Position must be in 1:2147483647", pos)
+# `pos` must be within the reference with the 0-based ID `ref_id`.
+# Invariant: The result is in `BAM_POSITIONS`, since reference lengths are at most
+# `typemax(Int32)`.
+function bam_position(refs::References, ref_id::Int32, pos::Integer)::Int32
+    ref_len = @inbounds refs.lengths[ref_id + 1]
+    in(pos, 1:ref_len) || throw_position_out_of_range(pos, ref_len)
     return Int32(pos) - Int32(1)
 end
 
-"""
-    set_reference!(record::BAMRecord, ref::Union{Nothing, Integer, AbstractString})::BAMRecord
-
-Set the reference (RNAME) of `record`, and return `record`. `ref` may be:
-* A 1-based index into [`references(record)`](@ref references), like the one returned
-  by [`reference_index`](@ref). Throw a `BoundsError` if it is out of bounds.
-* The name of a reference in `references(record)`. Throw a `KeyError` if no reference
-  has this name.
-* `nothing`, for a record with no reference.
-
-The next reference (RNEXT) is not changed, and the position is not checked against
-the length of the new reference.
-
-See also: [`reference_index`](@ref), [`reference_name`](@ref), [`set_next_reference!`](@ref)
-"""
-function set_reference!(record::BAMRecord, ref::Union{Nothing, Integer, AbstractString})
-    record.refID = bam_reference_id(record.refs, ref)
-    return record
+@noinline function throw_position_out_of_range(pos::Integer, ref_len::Int32)
+    throw(ArgumentError(lazy"Position must be in 1:$ref_len, the length of the reference, got $pos"))
 end
 
-"""
-    set_next_reference!(record::BAMRecord, ref::Union{Nothing, Integer, AbstractString})::BAMRecord
-
-Set the reference of the next segment in the template (RNEXT) of `record`, and
-return `record`. `ref` is as in [`set_reference!`](@ref).
-
-See also: [`next_reference_index`](@ref), [`next_reference_name`](@ref)
-"""
-function set_next_reference!(record::BAMRecord, ref::Union{Nothing, Integer, AbstractString})
-    record.next_refID = bam_reference_id(record.refs, ref)
-    return record
-end
-
-# The 0-based reference ID of `ref` in `refs`, or -1 if missing.
-# Invariant: The result is in `-1:(length(refs) - 1)`.
-function bam_reference_id(refs::References, ref::Union{Nothing, Integer, AbstractString})::Int32
-    ref === nothing && return Int32(-1)
+# The 0-based reference ID of `ref` in `refs`.
+# Invariant: The result is in `0:(length(refs) - 1)`.
+function bam_reference_id(refs::References, ref::Union{Integer, AbstractString})::Int32
     ref isa AbstractString && return @something reference_id(refs, ref) throw_key_error(ref)
     in(ref, 1:length(refs)) || throw(BoundsError(refs, ref))
     # References has at most typemax(Int32) elements
@@ -1268,6 +1293,156 @@ end
     aux isa XAMError && return placeholder
     v = get(aux, "CG", nothing)
     return v isa AbstractVector{UInt32} ? parent(v) : placeholder
+end
+
+"""
+    set_cigar!(record::BAMRecord, cigar::Union{Nothing, BAMCIGAR})::BAMRecord
+
+Set the CIGAR of `record` to `cigar`, or to missing if `cigar` is `nothing`, and return
+`record`. To set a `CIGARStrings.CIGAR`, convert it with `BAMCIGAR(cigar)` first.
+
+The CIGAR must match the sequence: If `record` has a sequence, the query length of
+`cigar` must equal the length of the sequence.
+
+!!! warning
+    This removes any `CG` auxiliary field of `record`. A `CG` field is only meaningful
+    as the storage of the record's CIGAR, so it would otherwise be stale.
+
+A CIGAR with more than 65535 operations does not fit in BAM's CIGAR field, so it is
+stored in a new `CG` auxiliary field, with a placeholder in the CIGAR field, as described
+in the SAM specification. [`cigar`](@ref) returns the full CIGAR.
+
+Throw an `ArgumentError`, leaving the record unchanged, if:
+* `cigar` has no operations. To set a missing CIGAR, pass `nothing`.
+* `record` has a sequence, and the query length of `cigar` differs from its length.
+* The record would be too long to be represented in BAM.
+* `cigar` has more than 65535 operations, and the record has no reference, or the
+  length of the sequence or the reference length of `cigar` is at least `2^28`, or the
+  record's auxiliary data is malformed. In these cases the CIGAR can't be stored.
+
+This moves the rest of the record's data, which is O(n) in the size of the record.
+`cigar` may be a view of the record's own data, e.g. `cigar(record)`.
+
+See also: [`cigar`](@ref)
+"""
+function set_cigar!(record::BAMRecord, cig::Union{Nothing, BAMCIGAR})
+    if cig === nothing
+        old_len = 4 * (record.n_cigar_op % Int)
+        replace_region!((_, _) -> nothing, record, cigar_offset(record), old_len, 0, nothing)
+        record.n_cigar_op = 0x0000
+    else
+        n_ops = length(cig)
+        iszero(n_ops) && throw(ArgumentError("Cannot set an empty CIGAR. To set a missing CIGAR, pass `nothing`"))
+        check_cigar_query_length(cig, record.l_seq % Int)
+        n_ops > typemax(UInt16) && return set_long_cigar!(record, cig)
+        unsafe_set_cigar_field!(record, MemoryView(cig))
+    end
+    delete_cg_tag!(record)
+    return record
+end
+
+function check_cigar_query_length(cig::BAMCIGAR, l_seq::Int)::Nothing
+    query_len = CIGARStrings.query_length(cig)
+    if !iszero(l_seq) && query_len != l_seq
+        throw_query_length_mismatch(query_len, l_seq)
+    end
+    return nothing
+end
+
+@noinline function throw_query_length_mismatch(query_len::Int, l_seq::Int)
+    throw(ArgumentError(lazy"Query length of CIGAR, $query_len, differs from sequence length $l_seq"))
+end
+
+# Replace the CIGAR field with `bytes`, the encoding of at most 65535 CIGAR operations.
+# `bytes` may alias the record's data. The CG tag is not changed.
+function unsafe_set_cigar_field!(record::BAMRecord, bytes::ImmutableMemoryView{UInt8})::Nothing
+    offset = cigar_offset(record)
+    old_len = 4 * (record.n_cigar_op % Int)
+    new_len = length(bytes)
+    src = data_indices(record.data, bytes)
+    # Aliased input that overlaps the end of the region would be split by the move
+    # when growing. This is not possible for input from accessors, so it's outlined.
+    region_end = offset + old_len
+    if src !== nothing && (new_len > old_len) & (first(src) <= region_end) & (last(src) > region_end)
+        return unsafe_set_cigar_field!(record, copy(bytes))
+    end
+    replace_region!(record, offset, old_len, new_len, src) do data, src_start
+        @inline
+        if src_start === nothing
+            GC.@preserve data bytes unsafe_copyto!(pointer(data, offset + 1), pointer(bytes), new_len % UInt)
+        else
+            unsafe_move_bytes!(data, offset + 1, src_start, new_len)
+        end
+    end
+    record.n_cigar_op = (new_len >>> 2) % UInt16
+    return nothing
+end
+
+
+# Delete the CG tag, which is stale after a new CIGAR is set.
+# If the auxiliary data is malformed, the tag can't be found, but it doesn't need to
+# be deleted either: `load_aux_cigar` never reads malformed auxiliary data.
+function delete_cg_tag!(record::BAMRecord)::Nothing
+    aux = aux_data(record)
+    aux isa XAMError || delete!(aux, "CG")
+    return nothing
+end
+
+# Set a CIGAR with more than 65535 operations, which is stored in the CG tag, with the
+# placeholder `kSmN` in the CIGAR field, where k is the sequence length, and m the
+# reference length (see `is_placeholder_cigar`). Outlined, since this is rare.
+# The query length of `cig` has already been checked.
+@noinline function set_long_cigar!(record::BAMRecord, cig::BAMCIGAR)::BAMRecord
+    # The placeholder is only recognised on records with a reference
+    if record.refID < 0
+        throw(ArgumentError("A CIGAR with more than 65535 operations can only be set on a record with a reference"))
+    end
+    l_seq = record.l_seq % Int
+    ref_len = CIGARStrings.ref_length(cig)
+    if max(l_seq, ref_len) > 0x0fff_ffff
+        throw(ArgumentError("The lengths of a CIGAR with more than 65535 operations must be less than 2^28"))
+    end
+    # A CG tag in malformed auxiliary data would not be read by `load_aux_cigar`
+    if aux_data(record) isa XAMError
+        throw(ArgumentError("A CIGAR with more than 65535 operations can't be set on a record with malformed auxiliary data"))
+    end
+    bytes = MemoryView(cig)
+    data = record.data
+    # Check the length before modifying anything. This ignores the removal of an
+    # existing CG tag, so it may reject records that would barely fit.
+    n_ops = length(cig)
+    new_total = length(data) - 4 * (record.n_cigar_op % Int) + 8 + CG_HEADER_BYTES + 4 * n_ops
+    new_total > typemax(UInt32) - BAM_FIXED_BYTES && throw_record_too_long()
+    # The edits below move the record's data, so aliased input is copied, e.g. if the
+    # input is the record's current CIGAR stored in the CG tag
+    if data_indices(data, bytes) !== nothing
+        bytes = copy(bytes)
+    end
+    offset = cigar_offset(record)
+    replace_region!(record, offset, 4 * (record.n_cigar_op % Int), 8, nothing) do data, _
+        mem = MemoryView(data)
+        inbounds_store_le!(mem, offset + 1, ((l_seq % UInt32) << 4) | 0x04) # S
+        inbounds_store_le!(mem, offset + 5, ((ref_len % UInt32) << 4) | 0x03) # N
+    end
+    record.n_cigar_op = 0x0002
+    # The auxiliary data was checked above, and moving it doesn't change it
+    delete!(aux_data_unchecked(record), "CG")
+    copyto!(append_cg_header!(data, n_ops), bytes)
+    return record
+end
+
+# Bytes of a CG tag before its array: tag, type 'B', element type 'I', and count
+const CG_HEADER_BYTES = 8
+
+# Append the header of a CG:B:I tag with `n_ops` elements to `data`, grow `data` to fit
+# the elements, and return a view of the bytes of the elements, to be filled by the caller.
+function append_cg_header!(data::Vector{UInt8}, n_ops::Int)::MutableMemoryView{UInt8}
+    old_len = length(data)
+    resize!(data, old_len + CG_HEADER_BYTES + 4 * n_ops)
+    mem = MemoryView(data)[(old_len + 1):end]
+    copyto!(mem, b"CGBI")
+    inbounds_store_le!(mem, 5, n_ops % UInt32)
+    return mem[(CG_HEADER_BYTES + 1):end]
 end
 
 function unsafe_load_fixed_fields(record::BAMRecord, buffer::ImmutableMemoryView{UInt8})
@@ -1846,12 +2021,7 @@ function try_copy_kind!(dst::BAMRecord, src::SAMRecord)::Union{BAMRecord, XAMErr
         cig = something(cig)
         delete!(dst_aux, "CG")
         # CG:B:I array of the CIGAR's BAM encoding
-        old_len = length(data)
-        resize!(data, old_len + 8 + 4 * length(cig))
-        mem = MemoryView(data)[(old_len + 1):end]
-        copyto!(mem, b"CGBI")
-        inbounds_store_le!(mem, 5, length(cig) % UInt32)
-        CIGARStrings.encode!(mem[9:end], BAMCIGAR, cig)
+        CIGARStrings.encode!(append_cg_header!(data, length(cig)), BAMCIGAR, cig)
     end
 
     # Maintain the invariant that the block size fits in a UInt32

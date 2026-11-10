@@ -3,7 +3,7 @@ using XAM2
 using XAM2: XAMErrors, Reference, try_write, try_parse_header, seek_first_record
 using BGZFLib: BGZFReader, BGZFWriter, BGZFError, VirtualOffset, virtual_position
 using MemoryViews: ImmutableMemoryView, MemoryView
-using CIGARStrings: CIGARStrings, CIGAR, CIGARError
+using CIGARStrings: CIGARStrings, CIGAR, BAMCIGAR, CIGARError
 using XAM2: AuxTag
 using XAM2.BufferIO: BufWriter, BufReader, ExpandReader, IOError, take_inner
 
