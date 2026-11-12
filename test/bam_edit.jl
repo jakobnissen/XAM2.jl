@@ -426,3 +426,75 @@ end
     @test sequence(record) isa BAMSeqString
     @test length(XAM2.unsafe_sequence_bytes(make_record("ACGT"))) == 2
 end
+
+@testset "Slicing the sequence" begin
+    refs = References(["chr1"], [10^9])
+    header = parse_header("@SQ\tSN:chr1\tLN:1000000000")
+    function make_record(cigar, seq, qual = "*"; aux = ["NM:i:1"])
+        fields = ["r", "0", "chr1", "5", "60", cigar, "*", "0", "0", seq, qual, aux...]
+        return try_sam_to_bam(sam_line(fields), refs)::BAMRecord
+    end
+    roundtrip(r) = only(read_bam(write_bam(mktempdir(), [r], header, refs)))
+    bam(s) = BAMCIGAR(CIGAR(s))
+
+    # Exhaustively against a naive implementation, with and without quality,
+    # and with a CIGAR that shrinks, keeps or grows the CIGAR field
+    bases = "=ACMGRSVTWYHKDBN"
+    for len in 1:9, has_qual in (false, true), idx in [i:j for i in 1:len for j in i:len]
+        seq = String([bases[mod1(3i + len, 16)] for i in 1:len])
+        qual = has_qual ? String([Char(0x21 + mod(5i, 94)) for i in 1:len]) : "*"
+        n = length(idx)
+        expected_qual = has_qual ? qual[idx] : "*"
+
+        record = make_record("*", seq, qual)
+        @test slice_sequence!(record, idx) === record
+        @test record == make_record("*", seq[idx], expected_qual)
+
+        for (old_cigar, new_cigar) in [
+                ("$(len)M", "$(n)M"),
+                ("$(len)=", nothing),
+                ("$(len)M", "1H" * "1M1D"^(n - 1) * "1M1H"),
+            ]
+            record = make_record(old_cigar, seq, qual)
+            cig = new_cigar === nothing ? nothing : bam(new_cigar)
+            @test slice_sequence!(record, idx, cig) === record
+            @test record == make_record(something(new_cigar, "*"), seq[idx], expected_qual)
+        end
+    end
+
+    # Missing quality stays missing, and the result can be written
+    record = make_record("2S5M1S", "ACGTACGT")
+    slice_sequence!(record, 3:7, bam("2H5M1H"))
+    @test record == make_record("2H5M1H", "GTACG")
+    @test roundtrip(record) == record
+
+    # Long CIGARs, and removal of the CG tag
+    n = 70_000
+    long = bam("1M1I"^n)
+    record = make_record("3M", "ACG")
+    set_cigar_and_sequence!(record, long, "AC"^n, nothing)
+    slice_sequence!(record, 2:(2n), bam("1I" * "1M1I"^(n - 1)))
+    @test sequence(record) == "C" * "AC"^(n - 1)
+    @test aux_data(record)["NM"] == 1
+    long2 = bam("1M1I"^(n - 1))
+    slice_sequence!(record, 2:(2n - 1), long2)
+    @test XAM2.cigar(record) == long2
+    @test sequence(record) == "AC"^(n - 1)
+    @test roundtrip(record) == record
+    slice_sequence!(record, 1:3, bam("3M"))
+    @test record == make_record("3M", "ACA")
+
+    # Invalid input throws, and leaves the record unchanged
+    record = make_record("3M", "ACG", "III")
+    before = copy(record)
+    @test_throws ArgumentError slice_sequence!(record, 1:2)
+    @test_throws ArgumentError slice_sequence!(record, 2:1, nothing)
+    @test_throws ArgumentError slice_sequence!(record, 0:2, nothing)
+    @test_throws ArgumentError slice_sequence!(record, 2:4, nothing)
+    @test_throws ArgumentError slice_sequence!(record, 1:2, bam("3M"))
+    @test record == before
+    # The whole sequence can be kept without a CIGAR argument
+    slice_sequence!(record, 1:3)
+    @test record == before
+    @test_throws ArgumentError slice_sequence!(make_record("*", "*"), 1:0)
+end

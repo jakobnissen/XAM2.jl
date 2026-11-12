@@ -1670,6 +1670,24 @@ function set_cigar_and_sequence!(
     s = normalize_seq(seq)
     q = normalize_qual(qual)
     n = check_seq_qual(s, q)
+    (seq_in, qual_in) = unaliased_seq_qual(record.data, s, q)
+    return replace_cigar_and_seq_qual!(record, cig, n) do data, offset
+        write_seq_qual!(data, offset, seq_in, qual_in, n)
+    end
+end
+
+# Replace the CIGAR, sequence and quality of `record` with `cig`, and `n` bases written
+# by `write_seq_qual!(data, offset)` after the 0-based `offset`, moving the rest of the
+# data once. `cig` is checked against `n` before anything is modified.
+# `write_seq_qual!` is called before the CIGAR is written, when the old CIGAR, sequence
+# and quality are still intact at their old offsets (see `replace_region!`), so it may
+# read them, as long as it writes nothing before the old sequence. It must not throw.
+function replace_cigar_and_seq_qual!(
+        write_seq_qual!::F,
+        record::BAMRecord,
+        cig::Union{Nothing, BAMCIGAR},
+        n::Int,
+    )::BAMRecord where {F}
     data = record.data
     old_len = 4 * (record.n_cigar_op % Int) + seq_qual_bytes(record.l_seq % Int)
     # Variables captured by the closure below are assigned only once, since
@@ -1683,18 +1701,18 @@ function set_cigar_and_sequence!(
             check_long_cigar_fits(record, cig, length(data) - old_len + 8 + seq_qual_bytes(n))
         end
     end
+    # Copied if aliased, since `write_seq_qual!` may overwrite the old CIGAR
     cig_bytes = cig === nothing ? nothing : unaliased(data, MemoryView(cig))
     ref_len = is_long ? CIGARStrings.ref_length(something(cig)) : 0
-    (seq_in, qual_in) = unaliased_seq_qual(data, s, q)
     cig_len = cig_bytes === nothing ? 0 : is_long ? 8 : length(cig_bytes)
     offset = cigar_offset(record)
     replace_region!(record, offset, old_len, cig_len + seq_qual_bytes(n), nothing) do data, _
+        write_seq_qual!(data, offset + cig_len)
         if is_long
             store_cigar_placeholder!(data, offset, n, ref_len)
         elseif cig_bytes !== nothing
             GC.@preserve data cig_bytes unsafe_copyto!(pointer(data, offset + 1), pointer(cig_bytes), cig_len % UInt)
         end
-        write_seq_qual!(data, offset + cig_len, seq_in, qual_in, n)
     end
     record.n_cigar_op = (cig_len >>> 2) % UInt16
     record.l_seq = n % UInt32
@@ -1704,6 +1722,123 @@ function set_cigar_and_sequence!(
         delete_cg_tag!(record)
     end
     return record
+end
+
+"""
+    slice_sequence!(record::BAMRecord, idx::AbstractUnitRange{<:Integer})::BAMRecord
+    slice_sequence!(record::BAMRecord, idx::AbstractUnitRange{<:Integer}, cigar::Union{Nothing, BAMCIGAR})::BAMRecord
+
+Keep only the bases at the 1-based indices `idx` of the sequence of `record`, and their
+quality scores, and return `record`. This is equivalent to
+`set_sequence!(record, sequence(record)[idx], quality_scores(record)[idx])`, but works
+in place, without allocating. Missing quality scores stay missing.
+
+With a CIGAR argument, the CIGAR is set like with [`set_cigar_and_sequence!`](@ref),
+which is needed to change the sequence length of a record with a CIGAR. E.g. to hard clip
+a read with CIGAR `2S8M`, use `slice_sequence!(record, 3:10, BAMCIGAR(CIGAR("2H8M")))`.
+A missing CIGAR (`nothing`) is valid for any record, also mapped ones. This
+function doesn't change the position, so if the alignment start moves, use
+[`set_placement!`](@ref).
+
+Throw an `ArgumentError`, leaving the record unchanged, if:
+* `idx` is empty, or not in `1:n` for a sequence of length `n`. A record with a missing
+  sequence has no bases to keep. To set a missing sequence, use [`set_sequence!`](@ref)
+  or [`set_cigar_and_sequence!`](@ref).
+* No CIGAR is given, `record` has a CIGAR, and `idx` is not the whole sequence.
+* A CIGAR is given, and [`set_cigar!`](@ref) would throw with a sequence of length
+  `length(idx)`.
+
+Like `set_cigar_and_sequence!`, the three-argument form removes any `CG` auxiliary field.
+
+This moves the rest of the record's data, which is O(n) in the size of the record.
+
+See also: [`set_sequence!`](@ref), [`set_cigar_and_sequence!`](@ref)
+"""
+function slice_sequence!(record::BAMRecord, idx::AbstractUnitRange{<:Integer})
+    (start, n) = check_slice(record, idx)
+    if !iszero(record.n_cigar_op) && n != record.l_seq
+        throw_argument_error("Cannot change the sequence length of a record with a CIGAR. Pass the new CIGAR to `slice_sequence!`")
+    end
+    l_seq = record.l_seq % Int
+    offset = seq_offset(record)
+    qual_missing = is_qual_missing(record)
+    replace_region!(record, offset, seq_qual_bytes(l_seq), seq_qual_bytes(n), nothing) do data, _
+        unsafe_slice_seq_qual!(data, offset, l_seq, start, n, qual_missing)
+    end
+    record.l_seq = n % UInt32
+    return record
+end
+
+function slice_sequence!(record::BAMRecord, idx::AbstractUnitRange{<:Integer}, cig::Union{Nothing, BAMCIGAR})
+    (start, n) = check_slice(record, idx)
+    l_seq = record.l_seq % Int
+    old_offset = seq_offset(record)
+    qual_missing = is_qual_missing(record)
+    return replace_cigar_and_seq_qual!(record, cig, n) do data, offset
+        unsafe_slice_seq_qual!(data, old_offset, l_seq, start, n, qual_missing)
+        # Move the sliced bases and quality from the old to the new sequence offset
+        unsafe_move_bytes!(data, offset + 1, old_offset + 1, seq_qual_bytes(n))
+    end
+end
+
+# Check that `idx` is a nonempty range of indices of the sequence of `record`, and
+# return its start and length.
+function check_slice(record::BAMRecord, idx::AbstractUnitRange{<:Integer})::Tuple{Int, Int}
+    start = Int(first(idx))::Int
+    stop = Int(last(idx))::Int
+    stop < start && throw_argument_error("Cannot slice to an empty sequence")
+    if (start < 1) | (stop > record.l_seq)
+        throw(ArgumentError(lazy"Range $idx is out of bounds for sequence of length $(record.l_seq)"))
+    end
+    return (start, stop - start + 1)
+end
+
+is_qual_missing(record::BAMRecord) = quality_scores(record) === nothing
+
+# Keep the `n` bases starting at the 1-based index `start` of the sequence of length
+# `l_seq` and their quality, moving them to the start of the sequence after the 0-based
+# `offset`. Their quality follows them, and is set to all `0xff` if `qual_missing`.
+# Writes nothing outside the old sequence and quality, which must be intact, and
+# `start:(start + n - 1)` must be in `1:l_seq`.
+@inline function unsafe_slice_seq_qual!(
+        data::Vector{UInt8},
+        offset::Int,
+        l_seq::Int,
+        start::Int,
+        n::Int,
+        qual_missing::Bool,
+    )::Nothing
+    n_bytes = cld(n, 2)
+    # Base `i` is in byte `(i + 1) >> 1`, in the high nibble if `i` is odd.
+    # New byte `j` is read from old bytes at index `j` or higher, so the bytes can be
+    # moved in order, without overwriting bytes that are yet to be read.
+    if isodd(start)
+        # The bases are byte-aligned, so the bytes are moved as they are
+        unsafe_move_bytes!(data, offset + 1, offset + (start + 1) >> 1, n_bytes)
+    else
+        # New byte `j` is the low nibble of old byte `k`, and the high nibble of byte
+        # `k + 1`, if the latter is in the sequence.
+        k0 = offset + start >> 1
+        n_full = n >> 1
+        for j in 1:n_full
+            k = k0 + j - 1
+            @inbounds data[offset + j] = (data[k] << 4) | (data[k + 1] >> 4)
+        end
+        if isodd(n)
+            @inbounds data[offset + n_bytes] = data[k0 + n_full] << 4
+        end
+    end
+    # Zero the padding nibble, which may hold a base of the old sequence
+    if isodd(n)
+        @inbounds data[offset + n_bytes] &= 0xf0
+    end
+    qual_dst = offset + n_bytes + 1
+    if qual_missing
+        @inbounds fill!(view(data, qual_dst:(qual_dst + n - 1)), 0xff)
+    else
+        unsafe_move_bytes!(data, qual_dst, offset + cld(l_seq, 2) + start, n)
+    end
+    return nothing
 end
 
 # In-place operations on the sequence and quality scores, which change no lengths
