@@ -395,3 +395,34 @@ end
     set_cigar_and_sequence!(record, bam("3M"), "ACG", nothing)
     @test record == make_record("3M", "ACG")
 end
+
+@testset "In-place sequence and quality" begin
+    refs = References(["chr1"], [1000])
+    function make_record(seq, qual = "*")
+        fields = ["r", "0", "chr1", "5", "60", "*", "*", "0", "0", seq, qual, "NM:i:1"]
+        return try_sam_to_bam(sam_line(fields), refs)::BAMRecord
+    end
+
+    # Passing the record's own scores to a setter is checked for aliasing
+    record = make_record("ACGTA", "ABCDE")
+    set_sequence!(record, "CGTA", quality_scores(record)[2:end])
+    @test record == make_record("CGTA", "BCDE")
+    record = make_record("ACGTA", "ABCDE")
+    set_sequence!(record, "ACGTA", quality_scores(record))
+    @test record == make_record("ACGTA", "ABCDE")
+    record = make_record("ACGTA", "ABCDE")
+    set_sequence!(record, "CGT", view(quality_scores(record), 2:4))
+    @test record == make_record("CGT", "BCD")
+
+    # Raw sequence bytes, with odd and even lengths
+    @test XAM2.unsafe_sequence_bytes(make_record("*")) isa XAM2.MutableMemoryView{UInt8}
+    @test isempty(XAM2.unsafe_sequence_bytes(make_record("*")))
+    record = make_record("ACGTA")
+    bytes = XAM2.unsafe_sequence_bytes(record)
+    @test bytes isa XAM2.MutableMemoryView{UInt8}
+    @test bytes == [0x12, 0x48, 0x10]
+    bytes[2] = 0xf0
+    @test sequence(record) == "ACN=A"
+    @test sequence(record) isa BAMSeqString
+    @test length(XAM2.unsafe_sequence_bytes(make_record("ACGT"))) == 2
+end

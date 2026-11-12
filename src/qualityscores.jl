@@ -1,20 +1,25 @@
 """
     QualityView <: AbstractVector{UInt8}
 
-Lazy view of the quality scores of a record, which converts between the two
+Lazy, immutable view of the quality of a record, which converts between the two
 encodings of quality scores on access:
 SAM stores PHRED scores plus 33, as printable ASCII characters, and BAM stores the PHRED
-scores themselves.
+scores themselves. The arithmetic wraps around, so out-of-range bytes never throw.
 
 A `QualityView` is returned by [`quality_scores(::SAMRecord)`](@ref quality_scores), where
-it subtracts 33 from each byte of the SAM record, and its bytes back the string returned by
-[`quality_string(::BAMRecord)`](@ref quality_string), where it adds 33 to each byte of the
-BAM record. The arithmetic wraps around, so out-of-range bytes never throw.
+it subtracts 33 from each byte of the SAM record, and is the code units of the string
+returned by [`quality_string(::BAMRecord)`](@ref quality_string), where it adds 33 to each
+byte of the BAM record.
 
-The elements are computed on every access. When the scores are accessed more than once,
-or when a contiguous array is needed (e.g. for `MemoryView` or `pointer`),
-materialize the view with `collect`, which returns a `Vector{UInt8}`. `collect`, and
-`copyto!` to other arrays, are efficient.
+This is a minimal `AbstractVector`: Only scalar indexing is overloaded, and the
+elements are computed on every access. `collect` and `copyto!` are efficient, but
+other operations use the generic, element-wise fallbacks. For bulk operations, use the
+encodings' native representations instead, which are plain memory:
+* For PHRED scores, use [`quality_scores(::BAMRecord)`](@ref quality_scores), or
+  materialize the view with `collect`, which returns a `Vector{UInt8}`.
+* For PHRED+33 characters, use [`quality_string(::SAMRecord)`](@ref quality_string).
+* To modify scores, use [`XAM2.set_quality_scores!`](@ref) or
+  [`XAM2.unsafe_quality_bytes`](@ref).
 
 !!! warning
     A `QualityView` aliases its record. Mutating the record will invalidate it.
@@ -58,10 +63,11 @@ Base.@propagate_inbounds function Base.getindex(x::QualityView, i::Int)
     return @inbounds(x.data[i]) + x.offset
 end
 
-# The generic `copyto!` checks for aliasing with `Base.mightalias`, which is slow for this
-# type, since it falls back to hashing with `objectid`. It also can't detect aliasing, since
-# `MemoryView` doesn't support it. So these methods don't check for aliasing, and their
-# destination must not alias the view, as documented.
+# The generic `copyto!` (also used by e.g. `collect` and `String`) checks for aliasing
+# with `Base.mightalias`, which is slow for this type, since it falls back to hashing
+# with `objectid`. It also can't detect aliasing, since `MemoryView` doesn't support it.
+# So these methods don't check for aliasing, and their destination must not alias the
+# view, as documented.
 Base.copyto!(dst::AbstractArray, src::QualityView) = copyto!(dst, firstindex(dst), src, 1, length(src))
 
 # Resolves a method ambiguity with Base

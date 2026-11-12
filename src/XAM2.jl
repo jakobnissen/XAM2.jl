@@ -32,6 +32,7 @@ using XAMAuxData: XAMAuxData, AuxTag, try_auxtag, is_well_formed
 using Automa: Automa, @re_str, onenter!, onexit!, onall!, rep, rep1, opt
 
 export BAMRecord,
+    BAMSeqString,
     BAMReader,
     BAMWriter,
     SAMRecord,
@@ -75,6 +76,7 @@ export BAMRecord,
     set_next_placement!,
     set_cigar!,
     set_sequence!,
+    set_quality_scores!,
     set_cigar_and_sequence!,
     set_template_length!,
     XAMError,
@@ -88,6 +90,8 @@ public try_parse!,
     try_init,
     try_copy!,
     QualityView,
+    unsafe_quality_bytes,
+    unsafe_sequence_bytes,
     try_write,
     Reference,
     reference,
@@ -346,6 +350,11 @@ function error_message(kind::XAMErrorKind)::String
     end
 end
 
+@noinline unreachable() = error(
+    "Unreachable reached. This indicates a bug in XAM2. " *
+        "Please report the stacktrace to github.com/BioJulia/XAM2.jl/issues"
+)
+
 function Base.showerror(io::IO, error::XAMError)
     print(io, "XAMError: ", error_message(error.kind))
     wrapped_error = error.wrapped_error
@@ -547,7 +556,7 @@ include("header.jl")
 include("references.jl")
 include("header_edit.jl")
 include("bamseq.jl")
-include("qualityview.jl")
+include("qualityscores.jl")
 include("sam.jl")
 include("bam.jl")
 include("samwriter.jl")

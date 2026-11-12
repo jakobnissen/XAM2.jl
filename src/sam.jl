@@ -523,7 +523,8 @@ end
     quality_string(record::SAMRecord)::Union{Nothing, StringView{ImmutableMemoryView{UInt8}}}
 
 Return the quality of `record` as a PHRED+33-encoded string, i.e. its QUAL field,
-or `nothing` if the quality is missing (`*`).
+or `nothing` if the quality is missing (`*`), which it is if the sequence is missing.
+The returned string is never empty.
 
 See also: [`quality_scores`](@ref)
 
@@ -539,10 +540,11 @@ end
 """
     quality_scores(record::SAMRecord)::Union{Nothing, QualityView}
 
-Return the PHRED quality scores of `record`, or `nothing` if the quality is missing (`*`).
+Return the PHRED quality scores of `record`, or `nothing` if the quality is missing (`*`),
+which it is if the sequence is missing. The returned scores are never empty.
 
 The scores have no offset, so e.g. a PHRED score of 31 is `UInt8(31)`, as opposed to
-`UInt8(31 + 33)` in the QUAL field. The scores are returned as a lazy
+`UInt8(31 + 33)` in the QUAL field. The scores are returned as a lazy, immutable
 [`XAM2.QualityView`](@ref), which subtracts 33 from the QUAL field on access.
 Use `collect` to materialize it to a `Vector{UInt8}`.
 

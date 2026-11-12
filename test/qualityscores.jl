@@ -1,6 +1,7 @@
-# Tests of QualityView, and the quality accessors that return it
+# Tests of QualityView, and the quality accessors and setters
 
-using XAM2: QualityView
+using XAM2: QualityView, unsafe_quality_bytes
+using MemoryViews: MutableMemoryView
 using XAM2: StringView
 
 @testset "Quality scores" begin
@@ -15,6 +16,8 @@ using XAM2: StringView
         @test_throws BoundsError q[4]
         @test collect(q) isa Vector{UInt8}
         @test collect(q) == [0x21, 0x42, 0x20]
+        # Immutable
+        @test_throws Base.CanonicalIndexError q[1] = 0x00
 
         # Copying to arrays of other types
         @test copyto!(zeros(UInt8, 3), q) == q
@@ -50,7 +53,10 @@ using XAM2: StringView
             end
         end
         @test quality_string(sam_records[1]) isa StringView{ImmutableMemoryView{UInt8}}
+        # Missing sequence, or only missing quality
         @test quality_scores(SAMRecord()) === nothing
+        @test quality_string(SAMRecord()) === nothing
+        @test quality_scores(try_parse_line(with_field(11, "*"))) === nothing
         @test collect(quality_scores(try_parse_line(with_field(11, "!+I~")))) == [0, 10, 40, 93]
     end
 
@@ -66,6 +72,51 @@ using XAM2: StringView
                 @test String(str) == expected
             end
         end
+        @test quality_scores(first(bam_records)) isa ImmutableMemoryView{UInt8}
         @test quality_string(BAMRecord(first(bam_records).refs)) === nothing
+        @test quality_scores(BAMRecord(first(bam_records).refs)) === nothing
+    end
+
+    @testset "Mutation" begin
+        refs = References(["chr1"], [1000])
+        function make_record(seq, qual = "*")
+            fields = ["r", "0", "chr1", "5", "60", "*", "*", "0", "0", seq, qual]
+            return try_sam_to_bam(sam_line(fields), refs)::BAMRecord
+        end
+
+        # Raw bytes, also when the quality is missing
+        bytes = unsafe_quality_bytes(make_record("*"))
+        @test bytes isa MutableMemoryView{UInt8}
+        @test isempty(bytes)
+        record = make_record("ACG")
+        bytes = unsafe_quality_bytes(record)
+        @test bytes isa MutableMemoryView{UInt8}
+        @test bytes == [0xff, 0xff, 0xff]
+        copyto!(bytes, [0x00, 0x0a, 0x28])
+        @test record == make_record("ACG", "!+I")
+        bytes[1] = 0xff
+        @test quality_scores(record) === nothing
+
+        # Checked setter
+        record = make_record("ACG")
+        @test set_quality_scores!(record, [0x00, 0x0a, 0x5d]) === record
+        @test record == make_record("ACG", "!+~")
+        set_quality_scores!(record, nothing)
+        @test record == make_record("ACG")
+        @test_throws ArgumentError set_quality_scores!(make_record("*"), [0x00])
+        @test_throws ArgumentError set_quality_scores!(make_record("*"), nothing)
+        record = make_record("ACG", "!+I")
+        @test_throws ArgumentError set_quality_scores!(record, [0x00, 0x00])
+        @test_throws ArgumentError set_quality_scores!(record, [0x00, 0x00, 0x5e])
+        @test_throws ArgumentError set_quality_scores!(record, [0xff, 0x00, 0x00])
+        @test record == make_record("ACG", "!+I")
+
+        # Sources that alias the record, or have other types
+        set_quality_scores!(record, quality_scores(record))
+        @test record == make_record("ACG", "!+I")
+        set_quality_scores!(record, quality_scores(make_record("ACG", "?+I")))
+        @test record == make_record("ACG", "?+I")
+        set_quality_scores!(record, quality_scores(try_parse_line(with_field(11, "!+I~")))[1:3])
+        @test record == make_record("ACG", "!+I")
     end
 end

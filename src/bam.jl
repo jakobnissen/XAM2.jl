@@ -749,36 +749,40 @@ function first_eq_seq_pos(record::BAMRecord)::Union{Nothing, Int}
 end
 
 """
-    sequence(rec::BAMRecord)::Union{Nothing, AbstractString}
+    sequence(rec::BAMRecord)::Union{Nothing, BAMSeqString}
 
-Get the query sequence of `rec` as an `AbstractString`, or
+Get the query sequence of `rec` as a [`BAMSeqString`](@ref), or
 `nothing` if the sequence is not available.
 
-The returned `AbstractString`'s type is an implementation detail, but it is guaranteed to:
-* Be constructed cheaply in constant time
-* Backed by a view into the existing data of the record (so not separately allocated)
-* Contain at least 1 codeunit, and having the codeunit type `UInt8`.
-* Containing only the `Char`s `"=ACMGRSVTWYHKDBN"` encoded in ASCII
+The string is constructed in constant time, and is a view into the record's data, so it
+is not separately allocated. It is never empty.
+
+With BioSequences loaded, use `XAM2.try_sequence(BioSequence, rec)` for a mutable
+view as a `BioSequence`, or `try_sequence(LongDNA{4}, rec)` for a copy.
 
 !!! warning
     The returned sequence aliases the record. Mutating the record will
     invalidate the sequence
 """
-function sequence(record::BAMRecord)::Union{BAMSeq, Nothing}
+function sequence(record::BAMRecord)::Union{BAMSeqString, Nothing}
     iszero(record.l_seq) && return nothing
     span = (seq_offset(record) + 1):qual_offset(record)
-    return BAMSeq(@inbounds(ImmutableMemoryView(record.data)[span]), record.l_seq % Int)
+    return BAMSeqString(@inbounds(ImmutableMemoryView(record.data)[span]), record.l_seq % Int)
 end
 
 """
     quality_scores(record::BAMRecord)::Union{Nothing, ImmutableMemoryView{UInt8}}
 
 Return the PHRED quality scores of `record`, or `nothing` if the quality is
-missing (stored as all `0xff`, or the sequence is missing).
+missing (stored as all `0xff`, or the sequence is missing). The returned scores are
+never empty.
 
 The scores have no offset, so e.g. a PHRED score of 31 is `UInt8(31)`, as opposed to
 `UInt8(31 + 33)` in SAM. They are stored like this in BAM, so this is a view of the
 record's data.
+
+To modify the scores, use [`set_quality_scores!`](@ref), or
+[`XAM2.unsafe_quality_bytes`](@ref).
 
 See also: [`quality_string`](@ref)
 
@@ -787,16 +791,11 @@ See also: [`quality_string`](@ref)
     invalidate the view.
 """
 function quality_scores(record::BAMRecord)::Union{Nothing, ImmutableMemoryView{UInt8}}
-    iszero(record.l_seq) && return nothing
-    span = (qual_offset(record) + 1):aux_offset(record)
-    qual = @inbounds ImmutableMemoryView(record.data)[span]
-
+    qual = unsafe_quality_bytes(record)
     # Missing quality is encoded as all-0xFF
-    return if @inbounds first(qual) == 0xff
-        nothing
-    else
-        qual
-    end
+    # A missing sequence has no quality bytes, and its quality is also missing
+    (isempty(qual) || @inbounds(first(qual)) == 0xff) && return nothing
+    return ImmutableMemoryView(qual)
 end
 
 """
@@ -804,6 +803,7 @@ end
 
 Return the quality of `record` as a PHRED+33-encoded string, as in the QUAL field of
 SAM, or `nothing` if the quality is missing (see [`quality_scores`](@ref)).
+The returned string is never empty.
 
 The string is backed by a lazy [`XAM2.QualityView`](@ref), which adds 33 to the
 PHRED scores of the record on access. Use `String` to materialize it.
@@ -1476,7 +1476,7 @@ function append_cg_header!(data::Vector{UInt8}, n_ops::Int)::MutableMemoryView{U
 end
 
 # Sequence and quality setters.
-# The sequence input is normalized to `nothing`, a `BAMSeq` whose packed bytes are
+# The sequence input is normalized to `nothing`, a `BAMSeqString` whose packed bytes are
 # copied, or a `UTF8String`, whose bytes are encoded. Their code units are a
 # `MemoryView` for `StringView`s and their substrings, so they are checked for aliasing.
 # Strings are passed instead of their code units, since passing a `CodeUnits` to a
@@ -1484,7 +1484,7 @@ end
 # The quality input is normalized to `nothing`, an `ImmutableMemoryView` if possible
 # (so it can be checked for aliasing, and copied without bounds checks), or else left as is.
 normalize_seq(::Nothing) = nothing
-normalize_seq(seq::BAMSeq) = seq
+normalize_seq(seq::BAMSeqString) = seq
 normalize_seq(seq::AbstractString) = to_utf8_string(seq)
 
 normalize_qual(::Nothing) = nothing
@@ -1492,7 +1492,7 @@ normalize_qual(qual::Union{DataView, Vector{UInt8}, Memory{UInt8}}) = ImmutableM
 normalize_qual(qual::AbstractVector{UInt8}) = qual
 
 seq_length(::Nothing) = 0
-seq_length(seq::BAMSeq) = ncodeunits(seq)
+seq_length(seq::BAMSeqString) = ncodeunits(seq)
 seq_length(seq::UTF8String) = ncodeunits(seq)
 
 # Check the sequence and quality input, and return the sequence length.
@@ -1511,14 +1511,27 @@ function check_seq_qual(seq, qual::Union{Nothing, AbstractVector{UInt8}})::Int
             ok || throw_invalid_value("Sequence can only contain the characters `=ACMGRSVTWYHKDBN` and their lowercase", Char(byte))
         end
     end
-    if qual !== nothing
-        length(qual) == n || throw_qual_length_mismatch(length(qual), n)
-        for q in qual
-            # The scores SAM can represent, as the printable characters `!` to `~`
-            q > 0x5d && throw_invalid_value("Quality scores must be in 0:93", Int(q))
-        end
-    end
+    qual === nothing || check_qual(qual, n)
     return n
+end
+
+# Check that `qual` are `n` quality scores which SAM can represent, i.e. in `0:93`,
+# the printable characters `!` to `~`.
+function check_qual(qual::AbstractVector{UInt8}, n::Int)
+    length(qual) == n || throw_qual_length_mismatch(length(qual), n)
+    bad = false
+    for q in qual
+        bad |= q > 0x5d
+    end
+    bad && throw_bad_qual(qual)
+    return nothing
+end
+
+@noinline function throw_bad_qual(qual::AbstractVector{UInt8})
+    for q in qual
+        q > 0x5d && throw_invalid_value("Quality scores must be in 0:93", Int(q))
+    end
+    return unreachable()
 end
 
 @noinline function throw_qual_length_mismatch(qual_len::Int, n::Int)
@@ -1527,8 +1540,8 @@ end
 
 # Return the inputs, copying those that alias `data`.
 function unaliased_seq_qual(data::Vector{UInt8}, seq, qual)
-    seq = if seq isa BAMSeq
-        data_indices(data, seq.data) === nothing ? seq : BAMSeq(copy_outlined(seq.data), seq.len)
+    seq = if seq isa BAMSeqString
+        data_indices(data, seq.data) === nothing ? seq : BAMSeqString(copy_outlined(seq.data), seq.len)
     elseif seq isa UTF8String && data_indices(data, codeunits(seq)) !== nothing
         StringView(copy_outlined(ImmutableMemoryView(codeunits(seq))))
     else
@@ -1548,8 +1561,8 @@ function write_seq_qual!(data::Vector{UInt8}, offset::Int, seq, qual, n::Int)::N
     mem = MemoryView(data)
     n_seq_bytes = cld(n, 2)
     seq_mem = @inbounds mem[(offset + 1):(offset + n_seq_bytes)]
-    if seq isa BAMSeq
-        # Invariant of `BAMSeq`: Its data has `n_seq_bytes` bytes
+    if seq isa BAMSeqString
+        # Invariant of `BAMSeqString`: Its data has `n_seq_bytes` bytes
         @inbounds copyto!(seq_mem, seq.data)
     else
         # Like `bamseq!`, but the input has already been checked
@@ -1689,6 +1702,116 @@ function set_cigar_and_sequence!(
         replace_cg_tag!(record, something(cig_bytes))
     else
         delete_cg_tag!(record)
+    end
+    return record
+end
+
+# In-place operations on the sequence and quality scores, which change no lengths
+
+"""
+    unsafe_sequence_bytes(record::BAMRecord)::MutableMemoryView{UInt8}
+
+Return a mutable view of the encoded sequence of `record`, which is empty if the
+sequence is missing. This is a low-level operation for modifying bases in place.
+For a mutable biological sequence, use `try_sequence(BioSequence, record)`, which needs
+BioSequences to be loaded.
+
+The view has `cld(n, 2)` bytes, for a sequence of length `n`. Each byte holds two bases
+as 4-bit codes, the first in the high nibble. The code of a base is its 0-based index in
+`"=ACMGRSVTWYHKDBN"`. If `n` is odd, the low nibble of the last byte is padding, which
+must be zero.
+
+This is unsafe in that the view is unchecked: It's the caller's responsibility to keep
+the padding nibble zero. Any change to the record that moves its sequence, e.g. setting
+its name or CIGAR, invalidates the view, after which writing to it corrupts the record.
+
+# Examples
+```julia
+# Set the 3rd base, which is in the high nibble of the 2nd byte, to `T`
+bytes = XAM2.unsafe_sequence_bytes(record)
+bytes[2] = (bytes[2] & 0x0f) | (0x08 << 4)
+```
+
+See also: [`sequence`](@ref), [`XAM2.unsafe_quality_bytes`](@ref)
+"""
+function unsafe_sequence_bytes(record::BAMRecord)::MutableMemoryView{UInt8}
+    # If the sequence is missing, this span is empty
+    span = (seq_offset(record) + 1):qual_offset(record)
+    return @inbounds MemoryView(record.data)[span]
+end
+
+"""
+    unsafe_quality_bytes(record::BAMRecord)::MutableMemoryView{UInt8}
+
+Return a mutable view of the encoded quality of `record`. This is a low-level operation
+for modifying quality scores in place. For a checked alternative, use
+[`set_quality_scores!`](@ref).
+
+The view has one byte per base, holding the PHRED score without offset, so it is empty
+if the sequence is missing. Unlike [`quality_scores`](@ref), this returns the bytes even
+if the quality is missing, in which case they are all `0xff`.
+
+This is unsafe in that the view is unchecked: Writing a score above 93 makes the record
+impossible to write as SAM, and writing `0xff` to the first byte makes the quality
+read as missing. Any change to the record that moves its quality, e.g. setting its name,
+CIGAR or sequence, invalidates the view, after which writing to it corrupts the record.
+
+# Examples
+```julia
+# Bin quality scores in place
+bytes = XAM2.unsafe_quality_bytes(record)
+if !isempty(bytes) && first(bytes) != 0xff
+    map!(q -> q < 20 ? 0x0a : 0x1e, bytes, bytes)
+end
+```
+
+See also: [`XAM2.unsafe_sequence_bytes`](@ref)
+"""
+function unsafe_quality_bytes(record::BAMRecord)::MutableMemoryView{UInt8}
+    # If the sequence is missing, this span is empty
+    span = (qual_offset(record) + 1):aux_offset(record)
+    return @inbounds MemoryView(record.data)[span]
+end
+
+"""
+    set_quality_scores!(record::BAMRecord, qual::Union{Nothing, AbstractVector{UInt8}})::BAMRecord
+
+Set the quality scores of `record` to `qual`, or mark them as missing if `qual` is
+`nothing`. Like [`quality_scores`](@ref), `qual` holds PHRED scores without offset.
+This works whether or not the quality is currently missing, and does not move any data
+of the record, since the length of the quality is the length of the sequence.
+To change the length, use [`set_sequence!`](@ref).
+
+Throw an `ArgumentError`, leaving the record unchanged, if:
+* `record` has no sequence
+* `qual` has a different length than the sequence, or contains a score above 93,
+  which SAM can't represent.
+
+`qual` may alias the record's quality, e.g. be its own [`quality_scores`](@ref).
+
+# Examples
+```julia
+# Bin quality scores, reusing a buffer across records
+buffer = UInt8[]
+for record in records
+    scores = quality_scores(record)
+    scores === nothing && continue
+    resize!(buffer, length(scores))
+    map!(q -> q < 20 ? 0x0a : 0x1e, buffer, scores)
+    set_quality_scores!(record, buffer)
+end
+```
+
+See also: [`XAM2.unsafe_quality_bytes`](@ref)
+"""
+function set_quality_scores!(record::BAMRecord, qual::Union{Nothing, AbstractVector{UInt8}})
+    bytes = unsafe_quality_bytes(record)
+    isempty(bytes) && throw_argument_error("A record without a sequence can't have quality scores")
+    if qual === nothing
+        fill!(bytes, 0xff)
+    else
+        check_qual(qual, length(bytes))
+        copyto!(bytes, qual)
     end
     return record
 end

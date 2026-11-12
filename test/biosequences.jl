@@ -1,6 +1,6 @@
 # Tests of the BioSequences extension
 
-using BioSequences: LongDNA, @dna_str
+using BioSequences: BioSequence, DNAAlphabet, LongDNA, @dna_str, DNA_N, DNA_Gap, DNA_T, DNA_A
 
 @testset "BioSequences extension" begin
     refs = References(["chr1"], [10])
@@ -52,5 +52,40 @@ using BioSequences: LongDNA, @dna_str
         @test error_kind(seq(r)) == XAMErrors.invalid_cigar
 
         @test_throws ArgumentError XAM2.sequence(LongDNA{4}, mapped("1", "2M", "=A"), dna"ACGT")
+    end
+
+    @testset "try_sequence(BioSequence, record)" begin
+        @test XAM2.try_sequence(BioSequence, mapped("1", "*", "*")) === nothing
+        # `=` can't be represented, at odd and even positions
+        for s in ["=", "A=", "=A", "ACGTACGTACGTACGT="]
+            @test XAM2.try_sequence(BioSequence, mapped("1", "*", s)) === XAM2.HasEq()
+        end
+        for s in ["A", "AC", "ACGTA", "ACMGRSVTWYHKDBN", "ACGTACGTACGTACGTA"]
+            r = mapped("1", "*", s)
+            v = XAM2.try_sequence(BioSequence, r)
+            @test v isa BioSequence{DNAAlphabet{4}}
+            @test length(v) == length(s)
+            @test String(v) == s
+            @test copy(v) isa LongDNA{4}
+            @test copy(v) == LongDNA{4}(s)
+            # Setting each base, at odd and even positions
+            for i in eachindex(s), base in [DNA_N, DNA_T]
+                r = mapped("1", "*", s)
+                v = XAM2.try_sequence(BioSequence, r)
+                v[i] = base
+                @test r == mapped("1", "*", s[1:(i - 1)] * string(base) * s[(i + 1):end])
+            end
+            # Gaps would be stored as `=`
+            @test_throws ArgumentError v[1] = DNA_Gap
+            @test_throws BoundsError v[0] = DNA_A
+            @test_throws BoundsError v[length(s) + 1] = DNA_A
+        end
+        r = mapped("1", "*", "ACGTA")
+        @test_throws ArgumentError XAM2.try_sequence(BioSequence, r)[2] = DNA_Gap
+        @test r == mapped("1", "*", "ACGTA")
+        # Slicing requires copying first
+        v = XAM2.try_sequence(BioSequence, mapped("1", "*", "ACGTA"))
+        @test_throws MethodError v[2:4]
+        @test copy(v)[2:4] == dna"CGT"
     end
 end

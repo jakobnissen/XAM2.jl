@@ -1,4 +1,19 @@
-struct BAMSeq <: AbstractString
+"""
+    BAMSeqString <: AbstractString
+
+Lazy, immutable view of the 4-bit encoded sequence of a [`BAMRecord`](@ref), returned by
+[`sequence(::BAMRecord)`](@ref sequence). Bases are decoded to ASCII on access.
+
+Its code units are `UInt8`, and it contains only the ASCII characters
+`"=ACMGRSVTWYHKDBN"`, so its characters, code units and indices correspond one to one.
+
+Passing a `BAMSeqString` to [`set_sequence!`](@ref) copies its encoded bases without
+re-encoding them.
+
+!!! warning
+    A `BAMSeqString` aliases its record. Mutating the record will invalidate it.
+"""
+struct BAMSeqString <: AbstractString
     # Invariant: `length(data) == cld(len, 2)`
     data::ImmutableMemoryView{UInt8}
     # Each byte stores two characters, so we need this field
@@ -6,7 +21,7 @@ struct BAMSeq <: AbstractString
     len::Int
 end
 
-Base.ncodeunits(x::BAMSeq) = x.len
+Base.ncodeunits(x::BAMSeqString) = x.len
 
 const SEQ_LUT = Tuple(b"=ACMGRSVTWYHKDBN")
 
@@ -39,9 +54,9 @@ const STRICT_ENCODE_LUT = let
     Tuple(result)
 end
 
-Base.codeunit(::BAMSeq) = UInt8
+Base.codeunit(::BAMSeqString) = UInt8
 
-function Base.codeunit(x::BAMSeq, i::Integer)
+function Base.codeunit(x::BAMSeqString, i::Integer)
     i = Int(i)::Int
     @boundscheck checkbounds(1:x.len, i)
     byte = @inbounds x.data[(i + 1) >> 1]
@@ -49,36 +64,36 @@ function Base.codeunit(x::BAMSeq, i::Integer)
     return SEQ_LUT[(byte & 0x0f) + 1]
 end
 
-function Base.thisind(x::BAMSeq, i::Int)
+function Base.thisind(x::BAMSeqString, i::Int)
     iszero(i) && return 0
     i == x.len + 1 && return i
     @boundscheck checkbounds(1:x.len, i)
     return i
 end
 
-Base.thisind(x::BAMSeq, i::Integer) = thisind(x, Int(i)::Int)
+Base.thisind(x::BAMSeqString, i::Integer) = thisind(x, Int(i)::Int)
 
-function Base.nextind(x::BAMSeq, i::Int, n::Int = 1)
+function Base.nextind(x::BAMSeqString, i::Int, n::Int = 1)
     @boundscheck checkbounds(0:x.len, i)
     return i + n
 end
 
-Base.nextind(x::BAMSeq, i::Integer, n::Integer = 1) = nextind(x, Int(i)::Int, Int(n)::Int)
+Base.nextind(x::BAMSeqString, i::Integer, n::Integer = 1) = nextind(x, Int(i)::Int, Int(n)::Int)
 
-function Base.iterate(x::BAMSeq, i::Int = 1)
+function Base.iterate(x::BAMSeqString, i::Int = 1)
     (i - 1) % UInt ≥ (x.len % UInt) && return nothing
     cu = @inbounds codeunit(x, i)
     return (reinterpret(Char, UInt32(cu) << 24), i + 1)
 end
 
-function Base.prevind(x::BAMSeq, i::Int, n::Int = 1)
+function Base.prevind(x::BAMSeqString, i::Int, n::Int = 1)
     @boundscheck checkbounds(1:(x.len + 1), i)
     return i - n
 end
 
-Base.prevind(x::BAMSeq, i::Integer, n::Integer = 1) = prevind(x, Int(i)::Int, Int(n)::Int)
+Base.prevind(x::BAMSeqString, i::Integer, n::Integer = 1) = prevind(x, Int(i)::Int, Int(n)::Int)
 
-function Base.isvalid(x::BAMSeq, i::Integer)
+function Base.isvalid(x::BAMSeqString, i::Integer)
     i = Int(i)::Int
     return in(i, 1:x.len)
 end
@@ -98,7 +113,7 @@ function bamseq!(dst::MutableMemoryView{UInt8}, src::ImmutableMemoryView{UInt8})
         encoding == 0xff && @goto bad_encoding
         @inbounds dst[(i + 1) >>> 1] |= encoding << (shift & 7)
     end
-    return BAMSeq(ImmutableMemoryView(dst[1:target_len]), length(src))
+    return BAMSeqString(ImmutableMemoryView(dst[1:target_len]), length(src))
     @label bad_encoding
     throw(ArgumentError("BAM sequence can only contain letters, `=` and `.`"))
 end
