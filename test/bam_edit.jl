@@ -498,3 +498,74 @@ end
     @test record == before
     @test_throws ArgumentError slice_sequence!(make_record("*", "*"), 1:0)
 end
+
+@testset "set_record!" begin
+    refs = References(["chr1", "chr2"], [10^9, 1000])
+    header = parse_header("@SQ\tSN:chr1\tLN:1000000000\n@SQ\tSN:chr2\tLN:1000")
+    sam(fields) = try_sam_to_bam(sam_line(fields), refs)::BAMRecord
+    roundtrip(r) = only(read_bam(write_bam(mktempdir(), [r], header, refs)))
+    bam(s) = BAMCIGAR(CIGAR(s))
+
+    # A full record, overwriting a record with other content, including aux data
+    record = sam(["old", "16", "chr2", "7", "3", "2M", "*", "0", "0", "AC", "II", "NM:i:1"])
+    @test set_record!(
+        record;
+        query_name = "r1",
+        flags = SAMFlags([SAMFlag.PAIRED, SAMFlag.READ1]),
+        reference = "chr1",
+        left_position = 100,
+        mapping_quality = 60,
+        cigar = bam("1S3M"),
+        sequence = "ACGT",
+        quality_scores = UInt8[0, 1, 2, 40],
+        next_reference = 2,
+        next_position = 5,
+        template_length = -50,
+    ) === record
+    @test record == sam(["r1", "65", "chr1", "100", "60", "1S3M", "chr2", "5", "-50", "ACGT", "!\"#I"])
+    @test roundtrip(record) == record
+
+    # Fields not given are reset
+    @test set_record!(record) == BAMRecord(refs)
+    set_record!(record; sequence = "AC", reference = 1, left_position = 3)
+    @test record == sam(["*", "4", "chr1", "3", "255", "*", "*", "0", "0", "AC", "*"])
+
+    # Inputs that alias the record's data
+    record = sam(["name", "0", "chr1", "5", "60", "2M1I", "*", "0", "0", "ACG", "ABC", "XN:Z:other"])
+    expected = copy(record)
+    set_record!(
+        record;
+        query_name = XAM2.query_name(record),
+        reference = "chr1",
+        left_position = 5,
+        flags = XAM2.flags(record),
+        mapping_quality = 60,
+        cigar = XAM2.cigar(record),
+        sequence = sequence(record),
+        quality_scores = quality_scores(record),
+    )
+    aux_data(record)["XN"] = "other"
+    @test record == expected
+
+    # Long CIGARs are stored in the CG tag
+    n = 70_000
+    long = bam("1M1I"^n)
+    set_record!(record; reference = "chr1", left_position = 1, cigar = long, sequence = "A"^(2n), flags = SAMFlags(0x0000))
+    @test XAM2.cigar(record) == long
+    @test roundtrip(record) == record
+
+    # Bad input throws
+    @test_throws ArgumentError set_record!(record; reference = "chr1")
+    @test_throws ArgumentError set_record!(record; next_position = 4)
+    @test_throws ArgumentError set_record!(record; flags = SAMFlags(0x0000))
+    @test_throws ArgumentError set_record!(record; cigar = bam("3M"), sequence = "AC")
+
+    # No allocations when reusing a record
+    function build!(r, c, q)
+        return set_record!(r; query_name = "read", reference = 1, left_position = 10, flags = SAMFlags(0x0000), cigar = c, sequence = "ACGTA", quality_scores = q)
+    end
+    c = bam("5M")
+    q = UInt8[1, 2, 3, 4, 5]
+    build!(record, c, q)
+    @test (@allocated build!(record, c, q)) == 0
+end

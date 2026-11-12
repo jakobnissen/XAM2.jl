@@ -309,11 +309,14 @@ const FIXED_BAM_OFFSET = fieldoffset(BAMRecord, 3)
 @assert sizeof(BAMRecord) == FIXED_BAM_OFFSET + BAM_FIXED_BYTES
 
 """
-    reset!(::BAMRecord)
+    reset!(record::BAMRecord)::BAMRecord
 
-Resets the `BAMRecord` to its default state, deleting all information from it.
+Reset `record` to its default state, deleting all information from it, and return it.
 After this function, the record is equal to an empty record created with
-`BAMRecord(record.refs)`.
+`BAMRecord(record.refs)`. The record keeps its allocated memory, so it can be reused
+without allocating.
+
+See also: [`set_record!`](@ref)
 """
 function reset!(record::BAMRecord)
     resize!(record.data, 2)
@@ -1949,6 +1952,120 @@ function set_quality_scores!(record::BAMRecord, qual::Union{Nothing, AbstractVec
         copyto!(bytes, qual)
     end
     return record
+end
+
+"""
+    set_record!(
+        record::BAMRecord;
+        query_name::Union{Nothing, AbstractString} = nothing,
+        flags::SAMFlags = SAMFlags([SAMFlag.UNMAP]),
+        reference::Union{Nothing, Integer, AbstractString} = nothing,
+        left_position::Union{Nothing, Integer} = nothing,
+        mapping_quality::Union{Nothing, Integer} = nothing,
+        cigar::Union{Nothing, BAMCIGAR} = nothing,
+        sequence::Union{Nothing, AbstractString} = nothing,
+        quality_scores::Union{Nothing, AbstractVector{UInt8}} = nothing,
+        next_reference::Union{Nothing, Integer, AbstractString} = nothing,
+        next_position::Union{Nothing, Integer} = nothing,
+        template_length::Union{Nothing, Integer} = nothing,
+    )::BAMRecord
+
+Set all fields of `record` except the auxiliary data, and return `record`.
+This is the way to build a record from scratch, e.g. in a read simulator.
+To avoid allocating a new record for each read, create one record with
+[`BAMRecord(refs)`](@ref BAMRecord), and call `set_record!` on it for each read.
+
+The fields that are not given are set to those of an empty record, so the result does
+not depend on the previous content of `record`: Missing values, no CIGAR or sequence,
+and flags with only `UNMAP` set. The auxiliary data is removed, and can be set
+afterwards with [`aux_data`](@ref).
+
+The keywords are named after the getters, and accept the same values as the
+corresponding setters, e.g. [`set_placement!`](@ref) for `reference` and
+`left_position`, and [`set_cigar_and_sequence!`](@ref) for `cigar`, `sequence` and
+`quality_scores`. `reference` and `left_position` must be given together, and so must
+`next_reference` and `next_position`.
+
+Unlike when calling the individual setters, the order of the fields doesn't matter:
+E.g. `flags` may lack `UNMAP` if `reference` and `left_position` are given.
+
+Throws like the individual setters. If this throws, `record` is valid, but its content
+is unspecified. Inputs may alias the record's data, e.g. be its own
+[`query_name`](@ref), in which case they are copied.
+
+# Examples
+```julia
+record = BAMRecord(refs)
+for read in simulated_reads
+    set_record!(
+        record;
+        query_name = read.name,
+        flags = SAMFlags([SAMFlag.REVERSE]),
+        reference = "chr1",
+        left_position = read.pos,
+        mapping_quality = 60,
+        cigar = read.cigar,
+        sequence = read.seq,
+        quality_scores = read.qual,
+    )
+    aux_data(record)["NM"] = read.nm
+    write(writer, record)
+end
+```
+
+See also: [`reset!`](@ref)
+"""
+function set_record!(
+        record::BAMRecord;
+        query_name::Union{Nothing, AbstractString} = nothing,
+        flags::SAMFlags = SAMFlags(0x0004),
+        reference::Union{Nothing, Integer, AbstractString} = nothing,
+        left_position::Union{Nothing, Integer} = nothing,
+        mapping_quality::Union{Nothing, Integer} = nothing,
+        cigar::Union{Nothing, BAMCIGAR} = nothing,
+        sequence::Union{Nothing, AbstractString} = nothing,
+        quality_scores::Union{Nothing, AbstractVector{UInt8}} = nothing,
+        next_reference::Union{Nothing, Integer, AbstractString} = nothing,
+        next_position::Union{Nothing, Integer} = nothing,
+        template_length::Union{Nothing, Integer} = nothing,
+    )
+    check_both_or_neither(reference, left_position, "reference", "left_position")
+    check_both_or_neither(next_reference, next_position, "next_reference", "next_position")
+    # Copy inputs that alias the data, since `reset!` overwrites it.
+    # Strings are normalized first, so their code units are checked for aliasing.
+    data = record.data
+    name = unaliased_string(data, query_name === nothing ? nothing : to_utf8_string(query_name))
+    cig = if cigar === nothing || data_indices(data, MemoryView(cigar)) === nothing
+        cigar
+    else
+        copy_outlined(cigar)
+    end
+    (seq, qual) = unaliased_seq_qual(data, normalize_seq(sequence), normalize_qual(quality_scores))
+    reset!(record)
+    # Placement must be set before flags without `UNMAP`, and before a long CIGAR
+    set_query_name!(record, name)
+    reference === nothing || set_placement!(record, reference, something(left_position))
+    set_flags!(record, flags)
+    set_mapping_quality!(record, mapping_quality)
+    next_reference === nothing || set_next_placement!(record, next_reference, something(next_position))
+    set_template_length!(record, template_length)
+    set_cigar_and_sequence!(record, cig, seq, qual)
+    return record
+end
+
+function check_both_or_neither(a, b, name_a::String, name_b::String)::Nothing
+    if (a === nothing) != (b === nothing)
+        throw(ArgumentError(lazy"`$name_a` and `$name_b` must be given together"))
+    end
+    return nothing
+end
+
+# Return `s`, or a copy of it if its code units alias `data`.
+unaliased_string(::Vector{UInt8}, ::Nothing) = nothing
+
+function unaliased_string(data::Vector{UInt8}, s::UTF8String)
+    data_indices(data, codeunits(s)) === nothing && return s
+    return StringView(copy_outlined(ImmutableMemoryView(codeunits(s))))
 end
 
 function unsafe_load_fixed_fields(record::BAMRecord, buffer::ImmutableMemoryView{UInt8})

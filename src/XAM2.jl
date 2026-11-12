@@ -80,11 +80,13 @@ export BAMRecord,
     set_cigar_and_sequence!,
     slice_sequence!,
     set_template_length!,
+    set_record!,
     XAMError,
     XAMErrorKind,
     XAMErrors
 
 public try_parse!,
+    reset!,
     try_read!,
     cigar,
     seek_first_record,
